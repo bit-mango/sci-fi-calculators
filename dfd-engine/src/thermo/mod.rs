@@ -1,3 +1,3 @@
 pub mod disassociation;
-pub mod material_properties;
+pub mod fluid_properties;
 pub mod reactions;

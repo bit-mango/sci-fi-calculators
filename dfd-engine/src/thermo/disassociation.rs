@@ -1,5 +1,5 @@
 use crate::constants::{R, STD_REFERENCE_PRESSURE};
-use crate::thermo::material_properties::TemperatureDependentProperty;
+use crate::thermo::fluid_properties::TemperatureDependentProperty;
 
 // Step 1: Determine chemical equilibrium of Propellants(H2 ⇌ 2H, CO ⇌ C + O  disassociation fractions).
 // Need to maximize Hydrogen disassociation but minimize Carbon Monoxide disassociation(to minimize coking).

@@ -1,4 +1,4 @@
-use crate::thermo::material_properties::TemperatureDependentProperty;
+use crate::thermo::fluid_properties::TemperatureDependentProperty;
 
 pub fn get_rxn_enthalpy(
     rxn_temperature: f64,
