@@ -18,9 +18,10 @@
 //
 
 mod constants;
+mod engine;
 mod nozzle;
 mod thermo;
-
+use crate::engine::cooling::calculate_heat_state;
 use crate::nozzle::{
     full_equilibrium_flow::calculate_full_quilibrium_flow_results,
     propellant::{Propellant, Species},
@@ -28,6 +29,7 @@ use crate::nozzle::{
 use crate::thermo::fluid_properties::ThermoReference;
 
 fn main() {
+    calculate_heat_state(56.617e6, 0.8, 1.0);
     let target_area_ratio = 100.0;
     let thermo_reference = ThermoReference::new();
     let propellant = Propellant::new(
@@ -41,7 +43,7 @@ fn main() {
     let chamber_temperature = 5_600.0;
     let chamber_pressure = 10.0;
     // Assume the propellant mixture starts at 1,000 K as it was preheated using waste heat.
-    let starting_temperature = 1_273.15;
+    let starting_temperature = 1_000.0;
 
     let full_equilibrium_flow_results = calculate_full_quilibrium_flow_results(
         &propellant,
@@ -65,7 +67,7 @@ fn main() {
     let chamber_temperature = 7_000.0;
     let chamber_pressure = 50.0;
     // Assume the propellant mixture starts at 1,000 K as it was preheated using waste heat.
-    let starting_temperature = 1_273.15;
+    let starting_temperature = 1_000.0;
 
     let full_equilibrium_flow_results = calculate_full_quilibrium_flow_results(
         &propellant,
@@ -86,7 +88,7 @@ fn main() {
     let chamber_temperature = 20_000.0;
     let chamber_pressure = 10.0;
     // Assume the propellant mixture starts at 1,000 K as it was preheated using waste heat.
-    let starting_temperature = 1_273.15;
+    let starting_temperature = 1_000.0;
 
     let full_equilibrium_flow_results = calculate_full_quilibrium_flow_results(
         &propellant,

@@ -8,5 +8,7 @@ pub const O_MW: f64 = 16.0e-3;
 pub const CO_MW: f64 = C_MW + O_MW;
 pub const N_MW: f64 = 14.0e-3;
 pub const N2_MW: f64 = 2.0 * N_MW;
+pub const CH4_MW: f64 = 16.0e-3;
+pub const H2O_MW: f64 = 18.0e-3;
 
 pub const STD_REFERENCE_PRESSURE: f64 = 1.0; // [bar]
