@@ -6,8 +6,6 @@ use crate::thermo::reactions::{get_rxn_enthalpy, get_rxn_entropy};
 #[derive(Default)]
 pub struct PropellantState {
     pub alphas: Vec<f64>,
-    pub n: Vec<f64>,  // Number of moles for each species.
-    pub x: Vec<f64>,  // Mol % for each species.
     pub h_total: f64, // Total enthalpy.
     pub s_total: f64, // Total entropy.
     pub avg_mw: f64,
@@ -191,9 +189,6 @@ impl<'a> Propellant<'a> {
             .sum()
     }
 
-    // TODO this seems like it should be in some propellant specific struct maybe? With defining characteristics of it?
-    // Chamber temp, pressure, propellant starting temp, etc. Then this type has two differnt flow logics you can use to analyze it?
-    // Oh and this type computes the average mw and stuff too. Maybe just propellant.rs?
     pub fn state(&self, temperature_k: f64, pressure_bar: f64) -> PropellantState {
         let alphas = self.alphas(temperature_k, pressure_bar);
 
@@ -207,8 +202,6 @@ impl<'a> Propellant<'a> {
 
         PropellantState {
             alphas,
-            n,
-            x,
             h_total,
             s_total,
             avg_mw,

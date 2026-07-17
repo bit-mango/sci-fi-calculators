@@ -1,4 +1,4 @@
-use crate::constants::G_0;
+use crate::{constants::G_0, nozzle::frozen_flow::FrozenFlowResult};
 
 use super::{
     frozen_flow::calculate_frozen_flow_results,
@@ -12,23 +12,57 @@ pub struct FullEquilibriumFlowResult {
     pub exit_pressure_bar: f64,
     pub engine_isp: f64,
     pub engine_thrust: f64,
+    pub frozen_flow_results: FrozenFlowResult,
 }
 
-// TODO save frozen flow results in here and print them in this summary, then remove manual println below.
 impl fmt::Display for FullEquilibriumFlowResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut alphas = "Chamber Alphas: \n".to_string();
+        for alpha in self.frozen_flow_results.chamber_alphas.iter() {
+            alphas += &format!("              ⍺_{}: {:.4}% \n", alpha.0, alpha.1);
+        }
         write!(
             f,
             "
-            ======= Full Equilibrium Flow Results =======
+            ========= Frozen Flow Results =========
+            Chamber Temperature:    {:.0} K
+            Chamber Pressure:       {:.3} bar
+            {}
+            Propellant m_dot:       {:.3} kg/s
+            Propellant Mean Mol Wt: {:.3} g
             Exit Temperature:       {:.0} K
-            Exit Pressure:          {:.4} bar
+            Exit Pressure:          {:.3} mbar
             Engine Isp:             {:.0} s
             Engine Thrust:          {:.3} kN
+            Engine Power Draw:      {:.3} MW
+
+            ==== Full Equilibrium Flow Results ====
+            Exit Temperature:       {:.0} K
+            Exit Pressure:          {:.3} mbar
+            Engine Isp:             {:.0} s
+            Engine Thrust:          {:.3} kN
+
+            =============== Overall ===============
+            Engine Isp Range(s):     {:.0} <-> {:.0}
+            Engine Thrust Range(kN): {:.3} <-> {:.3}
             ",
+            self.frozen_flow_results.chamber_temperature_k,
+            self.frozen_flow_results.chamber_pressure_bar,
+            alphas,
+            self.frozen_flow_results.propellant_m_dot,
+            self.frozen_flow_results.propellant_mean_mw * 1.0e3,
+            self.frozen_flow_results.exit_temperature_k,
+            self.frozen_flow_results.exit_pressure_bar * 1.0e3,
+            self.frozen_flow_results.engine_isp,
+            self.frozen_flow_results.engine_thrust / 1.0e3,
+            self.frozen_flow_results.engine_power_use / 1.0e6,
             self.exit_temperature_k,
-            self.exit_pressure_bar,
+            self.exit_pressure_bar * 1.0e3,
             self.engine_isp,
+            self.engine_thrust / 1.0e3,
+            self.frozen_flow_results.engine_isp,
+            self.engine_isp,
+            self.frozen_flow_results.engine_thrust / 1.0e3,
             self.engine_thrust / 1.0e3,
         )
     }
@@ -39,6 +73,7 @@ pub fn calculate_full_quilibrium_flow_results(
     chamber_temperature: f64,
     chamber_pressure: f64,
     propellant_m_dot: f64,
+    target_area_ratio: f64,
 ) -> FullEquilibriumFlowResult {
     let frozen_flow_results = calculate_frozen_flow_results(
         propellant,
@@ -46,9 +81,8 @@ pub fn calculate_full_quilibrium_flow_results(
         chamber_temperature,
         chamber_pressure,
         propellant_m_dot,
+        target_area_ratio,
     );
-
-    println!("{}", frozen_flow_results);
 
     // Assume full equilibrium flow for upper bound Isp. This is the exit velocity assuming we get full recombination.
     // Exit state recompute equilibrium at exit, T, P.
@@ -108,5 +142,6 @@ pub fn calculate_full_quilibrium_flow_results(
         exit_pressure_bar: frozen_flow_results.exit_pressure_bar,
         engine_isp: isp,
         engine_thrust: engine_thrust,
+        frozen_flow_results,
     }
 }

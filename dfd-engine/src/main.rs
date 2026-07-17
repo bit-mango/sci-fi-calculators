@@ -27,9 +27,8 @@ use crate::nozzle::{
 };
 use crate::thermo::fluid_properties::ThermoReference;
 
-// Use 10-100 bar for chamber pressure for now.
-
 fn main() {
+    let target_area_ratio = 100.0;
     let thermo_reference = ThermoReference::new();
     let propellant = Propellant::new(
         &thermo_reference,
@@ -39,10 +38,10 @@ fn main() {
         ],
     );
 
-    let chamber_temperature = 5_750.0;
+    let chamber_temperature = 5_600.0;
     let chamber_pressure = 10.0;
     // Assume the propellant mixture starts at 1,000 K as it was preheated using waste heat.
-    let starting_temperature = 1_000.0;
+    let starting_temperature = 1_273.15;
 
     let full_equilibrium_flow_results = calculate_full_quilibrium_flow_results(
         &propellant,
@@ -50,6 +49,7 @@ fn main() {
         chamber_temperature,
         chamber_pressure,
         1.0,
+        target_area_ratio,
     );
 
     println!("{}", full_equilibrium_flow_results);
@@ -62,17 +62,18 @@ fn main() {
         ],
     );
 
-    let chamber_temperature = 7_500.0;
-    let chamber_pressure = 10.0;
+    let chamber_temperature = 7_000.0;
+    let chamber_pressure = 50.0;
     // Assume the propellant mixture starts at 1,000 K as it was preheated using waste heat.
-    let starting_temperature = 1_000.0;
+    let starting_temperature = 1_273.15;
 
     let full_equilibrium_flow_results = calculate_full_quilibrium_flow_results(
         &propellant,
         starting_temperature,
         chamber_temperature,
         chamber_pressure,
-        1.0,
+        0.85,
+        target_area_ratio,
     );
 
     println!("{}", full_equilibrium_flow_results);
@@ -85,14 +86,15 @@ fn main() {
     let chamber_temperature = 20_000.0;
     let chamber_pressure = 10.0;
     // Assume the propellant mixture starts at 1,000 K as it was preheated using waste heat.
-    let starting_temperature = 1_000.0;
+    let starting_temperature = 1_273.15;
 
     let full_equilibrium_flow_results = calculate_full_quilibrium_flow_results(
         &propellant,
         starting_temperature,
         chamber_temperature,
         chamber_pressure,
-        0.1,
+        0.09,
+        target_area_ratio,
     );
 
     println!("{}", full_equilibrium_flow_results);
