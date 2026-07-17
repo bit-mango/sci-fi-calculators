@@ -6,10 +6,7 @@ pub const H2_MW: f64 = 2.0 * H_MW;
 pub const C_MW: f64 = 12.0e-3;
 pub const O_MW: f64 = 16.0e-3;
 pub const CO_MW: f64 = C_MW + O_MW;
+pub const N_MW: f64 = 14.0e-3;
+pub const N2_MW: f64 = 2.0 * N_MW;
 
 pub const STD_REFERENCE_PRESSURE: f64 = 1.0; // [bar]
-pub const ENTHALPY_HYDROGEN: f64 = 435.998e3; // ∆H [J/mol]
-pub const ENTROPY_HYDROGEN: f64 = 98.753; // ∆S [J/K•mol]
-
-pub const ENTHALPY_CARBON_MONOXIDE: f64 = 1076.375e3; // ∆H [J/mol]
-pub const ENTROPY_CARBON_MONOXIDE: f64 = 121.498; // ∆S [J/K•mol]

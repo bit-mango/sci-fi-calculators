@@ -2,8 +2,8 @@ use crate::thermo::fluid_properties::TemperatureDependentProperty;
 
 pub fn get_rxn_enthalpy(
     rxn_temperature: f64,
-    rxn_reactants: Vec<&TemperatureDependentProperty>,
-    rxn_products: Vec<&TemperatureDependentProperty>,
+    rxn_reactants: &Vec<&TemperatureDependentProperty>,
+    rxn_products: &Vec<&TemperatureDependentProperty>,
 ) -> f64 {
     let enthalpy_products: f64 = rxn_products
         .iter()
@@ -20,8 +20,8 @@ pub fn get_rxn_enthalpy(
 
 pub fn get_rxn_entropy(
     rxn_temperature: f64,
-    rxn_reactants: Vec<&TemperatureDependentProperty>,
-    rxn_products: Vec<&TemperatureDependentProperty>,
+    rxn_reactants: &Vec<&TemperatureDependentProperty>,
+    rxn_products: &Vec<&TemperatureDependentProperty>,
 ) -> f64 {
     let entropy_products: f64 = rxn_products
         .iter()

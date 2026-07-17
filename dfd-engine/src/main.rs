@@ -21,13 +21,10 @@ mod constants;
 mod nozzle;
 mod thermo;
 
-use crate::constants::{G_0, R, STD_REFERENCE_PRESSURE};
 use crate::nozzle::{
-    frozen_flow::calculate_frozen_flow_results,
     full_equilibrium_flow::calculate_full_quilibrium_flow_results,
     propellant::{Propellant, Species},
 };
-use crate::thermo::disassociation::calculate_disassociation_fraction;
 use crate::thermo::fluid_properties::ThermoReference;
 
 // Use 10-100 bar for chamber pressure for now.
@@ -35,46 +32,67 @@ use crate::thermo::fluid_properties::ThermoReference;
 fn main() {
     let thermo_reference = ThermoReference::new();
     let propellant = Propellant::new(
+        &thermo_reference,
         vec![
-            (
-                1.0,
-                Species::CO,
-                thermo_reference.get_tdp("CO"),
-                [
-                    (1.0, Species::C, thermo_reference.get_tdp("C")),
-                    (1.0, Species::O, thermo_reference.get_tdp("O")),
-                ],
-            ),
-            (
-                3.0,
-                Species::H2,
-                thermo_reference.get_tdp("H2"),
-                [
-                    (1.0, Species::H, thermo_reference.get_tdp("H")),
-                    (1.0, Species::H, thermo_reference.get_tdp("H")),
-                ],
-            ),
+            (1.0, Species::CO, vec![(1.0, Species::C), (1.0, Species::O)]),
+            (3.0, Species::H2, vec![(2.0, Species::H)]),
         ],
-        1_000.0,
-        5_750.0,
-        1.0,
-        5.0e-5,
-        1.0,
     );
 
     let chamber_temperature = 5_750.0;
     let chamber_pressure = 10.0;
-
-    let frozen_flow_results =
-        calculate_frozen_flow_results(&propellant, chamber_temperature, chamber_pressure, 1.0);
-
-    println!("{}", frozen_flow_results);
+    // Assume the propellant mixture starts at 1,000 K as it was preheated using waste heat.
+    let starting_temperature = 1_000.0;
 
     let full_equilibrium_flow_results = calculate_full_quilibrium_flow_results(
         &propellant,
+        starting_temperature,
         chamber_temperature,
         chamber_pressure,
         1.0,
+    );
+
+    println!("{}", full_equilibrium_flow_results);
+
+    let propellant = Propellant::new(
+        &thermo_reference,
+        vec![
+            (1.0, Species::N2, vec![(2.0, Species::N)]),
+            (3.0, Species::H2, vec![(2.0, Species::H)]),
+        ],
+    );
+
+    let chamber_temperature = 7_500.0;
+    let chamber_pressure = 10.0;
+    // Assume the propellant mixture starts at 1,000 K as it was preheated using waste heat.
+    let starting_temperature = 1_000.0;
+
+    let full_equilibrium_flow_results = calculate_full_quilibrium_flow_results(
+        &propellant,
+        starting_temperature,
+        chamber_temperature,
+        chamber_pressure,
+        1.0,
+    );
+
+    println!("{}", full_equilibrium_flow_results);
+
+    let propellant = Propellant::new(
+        &thermo_reference,
+        vec![(3.0, Species::H2, vec![(2.0, Species::H)])],
+    );
+
+    let chamber_temperature = 20_000.0;
+    let chamber_pressure = 10.0;
+    // Assume the propellant mixture starts at 1,000 K as it was preheated using waste heat.
+    let starting_temperature = 1_000.0;
+
+    let full_equilibrium_flow_results = calculate_full_quilibrium_flow_results(
+        &propellant,
+        starting_temperature,
+        chamber_temperature,
+        chamber_pressure,
+        0.1,
     );
 
     println!("{}", full_equilibrium_flow_results);

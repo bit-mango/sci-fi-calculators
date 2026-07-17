@@ -1,13 +1,7 @@
-use crate::constants::{
-    C_MW, CO_MW, ENTHALPY_CARBON_MONOXIDE, ENTHALPY_HYDROGEN, G_0, H_MW, H2_MW, O_MW, R,
-    STD_REFERENCE_PRESSURE,
-};
+use crate::constants::{G_0, R};
 
-use super::{calculate_state, propellant::Propellant};
-use crate::thermo::fluid_properties::ThermoReference;
+use super::propellant::Propellant;
 use std::fmt;
-
-use integrate::prelude::*;
 
 pub struct FrozenFlowResult {
     pub chamber_temperature_k: f64,
@@ -24,6 +18,8 @@ pub struct FrozenFlowResult {
     pub h_total: f64,
     pub s_total: f64,
 }
+
+// TODO print alphas?
 impl fmt::Display for FrozenFlowResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -55,60 +51,34 @@ impl fmt::Display for FrozenFlowResult {
 
 pub fn calculate_frozen_flow_results(
     propellant: &Propellant,
+    starting_temperature: f64,
     chamber_temperature: f64,
     chamber_pressure: f64,
     propellant_m_dot: f64,
 ) -> FrozenFlowResult {
-    let thermo_reference = ThermoReference::new();
+    let state_chamber = propellant.state(chamber_temperature, chamber_pressure);
 
-    let h_tdp = thermo_reference.get_tdp("H");
-    let h2_tdp = thermo_reference.get_tdp("H2");
-    let c_tdp = thermo_reference.get_tdp("C");
-    let o_tdp = thermo_reference.get_tdp("O");
-    let co_tdp = thermo_reference.get_tdp("CO");
-
-    let state_chamber = calculate_state(
-        propellant,
-        chamber_temperature,
-        chamber_pressure,
-        h_tdp,
-        h2_tdp,
-        c_tdp,
-        o_tdp,
-        co_tdp,
-    );
+    for i in 0..state_chamber.alphas.len() {
+        println!(
+            "⍺_{}: {:.4}%",
+            propellant.species[i].1.symbol(),
+            state_chamber.alphas[i] * 100.0
+        );
+    }
 
     // Mixture properties.
-    let alphas = &propellant.alphas(chamber_temperature, chamber_pressure);
-    let n = propellant.n(alphas);
-    let x = propellant.x(&n);
-
-    let mixture_mean_molecular_weight: f64 = propellant.avg_mw(&x);
-
-    let mixture_cp: f64 = propellant.avg_cp(&x, chamber_temperature);
-    let mixture_cp_mass_basis = mixture_cp / mixture_mean_molecular_weight;
-    let mixture_specific_gas_constant = R / mixture_mean_molecular_weight;
+    let mixture_cp_mass_basis = state_chamber.avg_cp / state_chamber.avg_mw;
+    let mixture_specific_gas_constant = R / state_chamber.avg_mw;
     let mixture_gamma =
         mixture_cp_mass_basis / (mixture_cp_mass_basis - mixture_specific_gas_constant);
 
-    // Assume the propellant mixture starts at 1,000 K as it was preheated using waste heat.
-    let mixture_starting_temperature = 1_000.0;
-
-    let state_start = calculate_state(
-        propellant,
-        mixture_starting_temperature,
-        chamber_pressure,
-        h_tdp,
-        h2_tdp,
-        c_tdp,
-        o_tdp,
-        co_tdp,
-    );
+    let state_start = propellant.state(starting_temperature, chamber_pressure);
 
     let feed_mass_kg = propellant.feed_mass();
     let engine_power =
         propellant_m_dot * (state_chamber.h_total - state_start.h_total) / feed_mass_kg;
 
+    // TODO do actual exit pressure calc.
     let exit_pressure = chamber_pressure * 5.0e-5;
 
     // Nozzle expansion. Assume frozen flow for lower bound Isp.
@@ -125,7 +95,7 @@ pub fn calculate_frozen_flow_results(
         chamber_temperature_k: chamber_temperature,
         chamber_pressure_bar: chamber_pressure,
         propellant_m_dot: propellant_m_dot,
-        propellant_mean_mw: mixture_mean_molecular_weight,
+        propellant_mean_mw: state_chamber.avg_mw,
         exit_temperature_k: exit_temperature,
         exit_pressure_bar: exit_pressure,
         engine_isp: isp,

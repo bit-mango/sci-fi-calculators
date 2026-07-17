@@ -1,12 +1,9 @@
-use crate::constants::{
-    C_MW, CO_MW, ENTHALPY_CARBON_MONOXIDE, ENTHALPY_HYDROGEN, G_0, H_MW, H2_MW, O_MW, R,
-    STD_REFERENCE_PRESSURE,
-};
+use crate::constants::G_0;
 
 use super::{
-    State, calculate_state, frozen_flow::calculate_frozen_flow_results, propellant::Propellant,
+    frozen_flow::calculate_frozen_flow_results,
+    propellant::{Propellant, PropellantState},
 };
-use crate::thermo::fluid_properties::ThermoReference;
 use std::fmt;
 
 #[derive(Default)]
@@ -16,6 +13,8 @@ pub struct FullEquilibriumFlowResult {
     pub engine_isp: f64,
     pub engine_thrust: f64,
 }
+
+// TODO save frozen flow results in here and print them in this summary, then remove manual println below.
 impl fmt::Display for FullEquilibriumFlowResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -36,26 +35,20 @@ impl fmt::Display for FullEquilibriumFlowResult {
 }
 pub fn calculate_full_quilibrium_flow_results(
     propellant: &Propellant,
+    starting_temperature: f64,
     chamber_temperature: f64,
     chamber_pressure: f64,
     propellant_m_dot: f64,
 ) -> FullEquilibriumFlowResult {
-    let thermo_reference = ThermoReference::new();
-
     let frozen_flow_results = calculate_frozen_flow_results(
         propellant,
+        starting_temperature,
         chamber_temperature,
         chamber_pressure,
         propellant_m_dot,
     );
 
-    // println!("{}", frozen_flow_results);
-
-    let h_tdp = thermo_reference.get_tdp("H");
-    let h2_tdp = thermo_reference.get_tdp("H2");
-    let c_tdp = thermo_reference.get_tdp("C");
-    let o_tdp = thermo_reference.get_tdp("O");
-    let co_tdp = thermo_reference.get_tdp("CO");
+    println!("{}", frozen_flow_results);
 
     // Assume full equilibrium flow for upper bound Isp. This is the exit velocity assuming we get full recombination.
     // Exit state recompute equilibrium at exit, T, P.
@@ -65,30 +58,12 @@ pub fn calculate_full_quilibrium_flow_results(
     let mut exit_temperature_high = chamber_temperature;
 
     let mut state_low;
-    let mut state_mid = State::default();
+    let mut state_mid = PropellantState::default();
     let mut state_high;
 
     for i in 0..100 {
-        state_low = calculate_state(
-            propellant,
-            exit_temperature_low,
-            frozen_flow_results.exit_pressure_bar,
-            h_tdp,
-            h2_tdp,
-            c_tdp,
-            o_tdp,
-            co_tdp,
-        );
-        state_high = calculate_state(
-            propellant,
-            exit_temperature_high,
-            frozen_flow_results.exit_pressure_bar,
-            h_tdp,
-            h2_tdp,
-            c_tdp,
-            o_tdp,
-            co_tdp,
-        );
+        state_low = propellant.state(exit_temperature_low, frozen_flow_results.exit_pressure_bar);
+        state_high = propellant.state(exit_temperature_high, frozen_flow_results.exit_pressure_bar);
 
         if frozen_flow_results.s_total < state_low.s_total
             || frozen_flow_results.s_total > state_high.s_total
@@ -101,16 +76,8 @@ pub fn calculate_full_quilibrium_flow_results(
             // Compute middle entropy
             exit_temperature_mid =
                 exit_temperature_low + (exit_temperature_high - exit_temperature_low) / 2.0;
-            state_mid = calculate_state(
-                propellant,
-                exit_temperature_mid,
-                frozen_flow_results.exit_pressure_bar,
-                h_tdp,
-                h2_tdp,
-                c_tdp,
-                o_tdp,
-                co_tdp,
-            );
+            state_mid =
+                propellant.state(exit_temperature_mid, frozen_flow_results.exit_pressure_bar);
 
             if (state_mid.s_total - frozen_flow_results.s_total).abs() < 0.001 {
                 break;

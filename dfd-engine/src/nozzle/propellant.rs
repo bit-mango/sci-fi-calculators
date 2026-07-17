@@ -1,46 +1,61 @@
-use crate::constants::{
-    C_MW, CO_MW, ENTHALPY_CARBON_MONOXIDE, ENTHALPY_HYDROGEN, G_0, H_MW, H2_MW, O_MW, R,
-    STD_REFERENCE_PRESSURE,
-};
+use crate::constants::*;
 use crate::thermo::disassociation::calculate_disassociation_fraction;
 use crate::thermo::fluid_properties::{TemperatureDependentProperty, ThermoReference};
 use crate::thermo::reactions::{get_rxn_enthalpy, get_rxn_entropy};
 
+#[derive(Default)]
+pub struct PropellantState {
+    pub alphas: Vec<f64>,
+    pub n: Vec<f64>,  // Number of moles for each species.
+    pub x: Vec<f64>,  // Mol % for each species.
+    pub h_total: f64, // Total enthalpy.
+    pub s_total: f64, // Total entropy.
+    pub avg_mw: f64,
+    pub avg_cp: f64,
+}
+
 pub struct Propellant<'a> {
-    species: Vec<(
+    pub species: Vec<(
         f64,
         Species,
         &'a TemperatureDependentProperty,
-        [(f64, Species, &'a TemperatureDependentProperty); 2],
+        Vec<(f64, Species, &'a TemperatureDependentProperty)>,
     )>, // moles, species, vec(disassociated (moles,species)
-    starting_temperature_k: f64,
-    chamber_temperature_k: f64,
-    chamber_pressure_bar: f64,
-    exit_pressure_bar: f64,
-    m_dot_kg_s: f64,
 }
 
 impl<'a> Propellant<'a> {
     pub fn new(
-        species: Vec<(
-            f64,
-            Species,
-            &'a TemperatureDependentProperty,
-            [(f64, Species, &'a TemperatureDependentProperty); 2],
-        )>,
-        starting_temperature_k: f64,
-        chamber_temperature_k: f64,
-        chamber_pressure_bar: f64,
-        exit_pressure_bar: f64,
-        m_dot_kg_s: f64,
+        thermo_reference: &'a ThermoReference,
+        species: Vec<(f64, Species, Vec<(f64, Species)>)>,
     ) -> Self {
+        for specie in species.iter() {
+            if specie.2.len() > 2 {
+                panic!("Can only disassociate into at most two species!");
+            }
+        }
+        let species_with_tdp = species
+            .iter()
+            .map(|(mol, specie, disassociated)| {
+                let disassociated_with_tdp = disassociated
+                    .iter()
+                    .map(|(d_mol, d_specie)| {
+                        (
+                            *d_mol,
+                            *d_specie,
+                            thermo_reference.get_tdp(&d_specie.symbol()),
+                        )
+                    })
+                    .collect();
+                (
+                    *mol,
+                    *specie,
+                    thermo_reference.get_tdp(&specie.symbol()),
+                    disassociated_with_tdp,
+                )
+            })
+            .collect();
         Self {
-            species,
-            starting_temperature_k,
-            chamber_temperature_k,
-            chamber_pressure_bar,
-            exit_pressure_bar,
-            m_dot_kg_s,
+            species: species_with_tdp,
         }
     }
 
@@ -50,22 +65,27 @@ impl<'a> Propellant<'a> {
             .iter()
             .map(|feed_stock_species_i| {
                 // First get disassociation rxn enthalpy and entropy.
-                let rxn_enthalpy = get_rxn_enthalpy(
-                    temperature_k,
-                    vec![feed_stock_species_i.2],
-                    vec![feed_stock_species_i.3[0].2, feed_stock_species_i.3[1].2],
-                );
-                let rxn_entropy = get_rxn_entropy(
-                    temperature_k,
-                    vec![feed_stock_species_i.2],
-                    vec![feed_stock_species_i.3[0].2, feed_stock_species_i.3[1].2],
-                );
+                let reactants = vec![feed_stock_species_i.2];
+
+                let products = if feed_stock_species_i.3.len() == 2 {
+                    vec![feed_stock_species_i.3[0].2, feed_stock_species_i.3[1].2]
+                } else {
+                    vec![feed_stock_species_i.3[0].2, feed_stock_species_i.3[0].2]
+                };
+                let product_factor = if feed_stock_species_i.3.len() == 2 {
+                    1.0
+                } else {
+                    4.0
+                };
+                let rxn_enthalpy = get_rxn_enthalpy(temperature_k, &reactants, &products);
+                let rxn_entropy = get_rxn_entropy(temperature_k, &reactants, &products);
 
                 let alpha = calculate_disassociation_fraction(
                     temperature_k,
                     pressure_bar,
                     rxn_enthalpy,
                     rxn_entropy,
+                    product_factor,
                 );
                 alpha
             })
@@ -81,8 +101,9 @@ impl<'a> Propellant<'a> {
         for i in 0..self.species.len() {
             let alpha = alphas[i];
             n.push(self.species[i].0 * (1.0 - alpha));
-            n.push(self.species[i].0 * self.species[i].3[0].0 * alpha);
-            n.push(self.species[i].0 * self.species[i].3[1].0 * alpha);
+            for disassociated_specie in self.species[i].3.iter() {
+                n.push(self.species[i].0 * disassociated_specie.0 * alpha);
+            }
         }
 
         n
@@ -139,10 +160,10 @@ impl<'a> Propellant<'a> {
         for specie in self.species.iter() {
             mw_total += x[i] * specie.1.mw();
             i += 1;
-            mw_total += x[i] * specie.3[0].1.mw();
-            i += 1;
-            mw_total += x[i] * specie.3[1].1.mw();
-            i += 1;
+            for disassociated_specie in specie.3.iter() {
+                mw_total += x[i] * disassociated_specie.1.mw();
+                i += 1;
+            }
         }
 
         mw_total
@@ -154,10 +175,10 @@ impl<'a> Propellant<'a> {
         for specie in self.species.iter() {
             cp_total += x[i] * specie.2.cp(temperature_k);
             i += 1;
-            cp_total += x[i] * specie.3[0].2.cp(temperature_k);
-            i += 1;
-            cp_total += x[i] * specie.3[1].2.cp(temperature_k);
-            i += 1;
+            for disassociated_specie in specie.3.iter() {
+                cp_total += x[i] * disassociated_specie.2.cp(temperature_k);
+                i += 1;
+            }
         }
 
         cp_total
@@ -169,14 +190,42 @@ impl<'a> Propellant<'a> {
             .map(|specie| specie.0 * specie.1.mw())
             .sum()
     }
+
+    // TODO this seems like it should be in some propellant specific struct maybe? With defining characteristics of it?
+    // Chamber temp, pressure, propellant starting temp, etc. Then this type has two differnt flow logics you can use to analyze it?
+    // Oh and this type computes the average mw and stuff too. Maybe just propellant.rs?
+    pub fn state(&self, temperature_k: f64, pressure_bar: f64) -> PropellantState {
+        let alphas = self.alphas(temperature_k, pressure_bar);
+
+        let n = self.n(&alphas);
+        let h_total = self.h_total(&n, temperature_k);
+        let x = self.x(&n);
+        let s_total = self.s_total(&x, &n, temperature_k, pressure_bar);
+
+        let avg_mw: f64 = self.avg_mw(&x);
+        let avg_cp: f64 = self.avg_cp(&x, temperature_k);
+
+        PropellantState {
+            alphas,
+            n,
+            x,
+            h_total,
+            s_total,
+            avg_mw,
+            avg_cp,
+        }
+    }
 }
 
+#[derive(Copy, Clone)]
 pub enum Species {
     H,
     H2,
     C,
     O,
     CO,
+    N2,
+    N,
 }
 
 impl Species {
@@ -187,6 +236,8 @@ impl Species {
             Species::C => "C".to_string(),
             Species::O => "O".to_string(),
             Species::CO => "CO".to_string(),
+            Species::N2 => "N2".to_string(),
+            Species::N => "N".to_string(),
         }
     }
 
@@ -197,6 +248,8 @@ impl Species {
             Species::C => C_MW,
             Species::O => O_MW,
             Species::CO => CO_MW,
+            Species::N2 => N2_MW,
+            Species::N => N_MW,
         }
     }
 }

@@ -1,5 +1,4 @@
 use crate::constants::{R, STD_REFERENCE_PRESSURE};
-use crate::thermo::fluid_properties::TemperatureDependentProperty;
 
 // Step 1: Determine chemical equilibrium of Propellants(H2 ⇌ 2H, CO ⇌ C + O  disassociation fractions).
 // Need to maximize Hydrogen disassociation but minimize Carbon Monoxide disassociation(to minimize coking).
@@ -16,12 +15,13 @@ pub fn calculate_disassociation_fraction(
     chamber_pressure_bar: f64,
     enthalpy: f64,
     entropy: f64,
+    product_factor: f64,
 ) -> f64 {
     let gibbs = enthalpy - chamber_temperature_k * entropy;
     let kp = (-gibbs / (R * chamber_temperature_k)).exp();
 
     let numerator = kp * STD_REFERENCE_PRESSURE / chamber_pressure_bar;
-    let denominator = 4.0 + numerator;
+    let denominator = product_factor + numerator;
     let alpha = (numerator / denominator).sqrt();
 
     alpha
