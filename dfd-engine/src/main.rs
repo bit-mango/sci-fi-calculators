@@ -33,23 +33,34 @@ use crate::thermo::fluid_properties::ThermoReference;
 // Use 10-100 bar for chamber pressure for now.
 
 fn main() {
-    let species = Species::H;
-    println!("Species: {}, mw: {}", species.symbol(), species.mw());
-    let propellant = Propellant {
-        species_feed_stock: vec![(1.0, Species::CO), (3.0, Species::H2)],
-        species_with_disassociation: vec![
-            (1.0, Species::CO),
-            (1.0, Species::C),
-            (1.0, Species::O),
-            (3.0, Species::H2),
-            (2.0, Species::H),
+    let thermo_reference = ThermoReference::new();
+    let propellant = Propellant::new(
+        vec![
+            (
+                1.0,
+                Species::CO,
+                thermo_reference.get_tdp("CO"),
+                [
+                    (1.0, Species::C, thermo_reference.get_tdp("C")),
+                    (1.0, Species::O, thermo_reference.get_tdp("O")),
+                ],
+            ),
+            (
+                3.0,
+                Species::H2,
+                thermo_reference.get_tdp("H2"),
+                [
+                    (1.0, Species::H, thermo_reference.get_tdp("H")),
+                    (1.0, Species::H, thermo_reference.get_tdp("H")),
+                ],
+            ),
         ],
-        starting_temperature_k: 1_000.0,
-        chamber_temperature_k: 5_750.0,
-        chamber_pressure_bar: 1.0,
-        exit_pressure_bar: 5.0e-5,
-        m_dot_kg_s: 1.0,
-    };
+        1_000.0,
+        5_750.0,
+        1.0,
+        5.0e-5,
+        1.0,
+    );
 
     let chamber_temperature = 5_750.0;
     let chamber_pressure = 10.0;

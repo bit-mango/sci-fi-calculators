@@ -43,7 +43,7 @@ impl fmt::Display for FrozenFlowResult {
             self.chamber_temperature_k,
             self.chamber_pressure_bar,
             self.propellant_m_dot,
-            self.propellant_mean_mw,
+            self.propellant_mean_mw * 1.0e3,
             self.exit_temperature_k,
             self.exit_pressure_bar,
             self.engine_isp,
@@ -68,6 +68,7 @@ pub fn calculate_frozen_flow_results(
     let co_tdp = thermo_reference.get_tdp("CO");
 
     let state_chamber = calculate_state(
+        propellant,
         chamber_temperature,
         chamber_pressure,
         h_tdp,
@@ -78,30 +79,15 @@ pub fn calculate_frozen_flow_results(
     );
 
     // Mixture properties.
-    let mw = vec![CO_MW, C_MW, O_MW, H2_MW, H_MW];
-    let mixture_mean_molecular_weight: f64 = state_chamber
-        .x
-        .iter()
-        .zip(mw.iter())
-        .map(|(x_i, mw_i)| x_i * mw_i)
-        .sum();
+    let alphas = &propellant.alphas(chamber_temperature, chamber_pressure);
+    let n = propellant.n(alphas);
+    let x = propellant.x(&n);
 
-    let cp = vec![
-        co_tdp.cp(chamber_temperature),
-        c_tdp.cp(chamber_temperature),
-        o_tdp.cp(chamber_temperature),
-        h2_tdp.cp(chamber_temperature),
-        h_tdp.cp(chamber_temperature),
-    ];
-    let mixture_cp: f64 = state_chamber
-        .x
-        .iter()
-        .zip(cp.iter())
-        .map(|(x_i, cp_i)| x_i * cp_i)
-        .sum();
-    let mixture_mean_molecular_weight_kg = mixture_mean_molecular_weight / 1.0e3;
-    let mixture_cp_mass_basis = mixture_cp / mixture_mean_molecular_weight_kg;
-    let mixture_specific_gas_constant = R / mixture_mean_molecular_weight_kg;
+    let mixture_mean_molecular_weight: f64 = propellant.avg_mw(&x);
+
+    let mixture_cp: f64 = propellant.avg_cp(&x, chamber_temperature);
+    let mixture_cp_mass_basis = mixture_cp / mixture_mean_molecular_weight;
+    let mixture_specific_gas_constant = R / mixture_mean_molecular_weight;
     let mixture_gamma =
         mixture_cp_mass_basis / (mixture_cp_mass_basis - mixture_specific_gas_constant);
 
@@ -109,6 +95,7 @@ pub fn calculate_frozen_flow_results(
     let mixture_starting_temperature = 1_000.0;
 
     let state_start = calculate_state(
+        propellant,
         mixture_starting_temperature,
         chamber_pressure,
         h_tdp,
@@ -118,7 +105,7 @@ pub fn calculate_frozen_flow_results(
         co_tdp,
     );
 
-    let feed_mass_kg = 0.034;
+    let feed_mass_kg = propellant.feed_mass();
     let engine_power =
         propellant_m_dot * (state_chamber.h_total - state_start.h_total) / feed_mass_kg;
 

@@ -70,6 +70,7 @@ pub fn calculate_full_quilibrium_flow_results(
 
     for i in 0..100 {
         state_low = calculate_state(
+            propellant,
             exit_temperature_low,
             frozen_flow_results.exit_pressure_bar,
             h_tdp,
@@ -79,6 +80,7 @@ pub fn calculate_full_quilibrium_flow_results(
             co_tdp,
         );
         state_high = calculate_state(
+            propellant,
             exit_temperature_high,
             frozen_flow_results.exit_pressure_bar,
             h_tdp,
@@ -100,6 +102,7 @@ pub fn calculate_full_quilibrium_flow_results(
             exit_temperature_mid =
                 exit_temperature_low + (exit_temperature_high - exit_temperature_low) / 2.0;
             state_mid = calculate_state(
+                propellant,
                 exit_temperature_mid,
                 frozen_flow_results.exit_pressure_bar,
                 h_tdp,
@@ -127,7 +130,7 @@ pub fn calculate_full_quilibrium_flow_results(
         }
     }
 
-    let feed_mass_kg = 0.034; // 1 mol CO (28g) + 3 mol H2 (6g) = 34g, fixed regardless of dissociation state
+    let feed_mass_kg = propellant.feed_mass(); // 1 mol CO (28g) + 3 mol H2 (6g) = 34g, fixed regardless of dissociation state
     let delta_h_per_kg = (frozen_flow_results.h_total - state_mid.h_total) / feed_mass_kg;
     let exit_velocity = (2.0 * delta_h_per_kg).sqrt();
     let isp = exit_velocity / G_0;
