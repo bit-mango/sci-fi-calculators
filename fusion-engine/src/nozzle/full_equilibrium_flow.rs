@@ -21,6 +21,9 @@ impl fmt::Display for FullEquilibriumFlowResult {
         for alpha in self.frozen_flow_results.chamber_alphas.iter() {
             alphas += &format!("              ⍺_{}: {:.4}% \n", alpha.0, alpha.1);
         }
+        let estimated_isp = 0.85 * (self.engine_isp - self.frozen_flow_results.engine_isp)
+            + self.frozen_flow_results.engine_isp;
+        let estimated_thrust = estimated_isp * G_0 * self.frozen_flow_results.propellant_m_dot;
         write!(
             f,
             "
@@ -45,6 +48,8 @@ impl fmt::Display for FullEquilibriumFlowResult {
             =============== Overall ===============
             Engine Isp Range(s):     {:.0} <-> {:.0}
             Engine Thrust Range(kN): {:.3} <-> {:.3}
+            Estimated Isp(s):        {:.0}
+            Estimated Thrust(kN):    {:.3}
             ",
             self.frozen_flow_results.chamber_temperature_k,
             self.frozen_flow_results.chamber_pressure_bar,
@@ -64,6 +69,8 @@ impl fmt::Display for FullEquilibriumFlowResult {
             self.engine_isp,
             self.frozen_flow_results.engine_thrust / 1.0e3,
             self.engine_thrust / 1.0e3,
+            estimated_isp,
+            estimated_thrust / 1.0e3
         )
     }
 }
