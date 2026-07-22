@@ -2,16 +2,19 @@ use crate::constants::*;
 use crate::thermo::disassociation::calculate_disassociation_fraction;
 use crate::thermo::fluid_properties::{TemperatureDependentProperty, ThermoReference};
 use crate::thermo::reactions::{get_rxn_enthalpy, get_rxn_entropy};
+use std::collections::HashMap;
 
 #[derive(Default)]
 pub struct PropellantState {
     pub alphas: Vec<f64>,
     pub h_total: f64, // Total enthalpy.
     pub s_total: f64, // Total entropy.
+    pub n_total: f64, // Total moles.
     pub avg_mw: f64,
     pub avg_cp: f64,
 }
 
+#[derive(Clone)]
 pub struct Propellant<'a> {
     pub species: Vec<(
         f64,
@@ -55,6 +58,35 @@ impl<'a> Propellant<'a> {
         Self {
             species: species_with_tdp,
         }
+    }
+
+    pub fn mix(&self, other: &Self) -> Self {
+        let mut species_mix: HashMap<
+            String,
+            (
+                f64,
+                Species,
+                &'a TemperatureDependentProperty,
+                Vec<(f64, Species, &'a TemperatureDependentProperty)>,
+            ),
+        > = HashMap::new();
+        // Add all of original species to mix.
+        for s in self.species.iter() {
+            let key = s.1.symbol();
+            species_mix.insert(key, s.clone());
+        }
+        for o in other.species.iter() {
+            let key = o.1.symbol();
+            if let Some(entry) = species_mix.get_mut(&key) {
+                // Species already exists! Increment moles.
+                entry.0 += o.0;
+            } else {
+                // Species is new, add them.
+                species_mix.insert(key, o.clone());
+            }
+        }
+        let species = species_mix.drain().map(|(_, v)| v).collect();
+        Self { species }
     }
 
     pub fn alphas(&self, temperature_k: f64, pressure_bar: f64) -> Vec<f64> {
@@ -197,6 +229,7 @@ impl<'a> Propellant<'a> {
         let x = self.x(&n);
         let s_total = self.s_total(&x, &n, temperature_k, pressure_bar);
 
+        let n_total = n.iter().sum();
         let avg_mw: f64 = self.avg_mw(&x);
         let avg_cp: f64 = self.avg_cp(&x, temperature_k);
 
@@ -204,13 +237,14 @@ impl<'a> Propellant<'a> {
             alphas,
             h_total,
             s_total,
+            n_total,
             avg_mw,
             avg_cp,
         }
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq)]
 pub enum Species {
     H,
     H2,

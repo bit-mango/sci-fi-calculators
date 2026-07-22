@@ -8,8 +8,8 @@ const AU: f64 = 1.495978707e11; // m
 const R_MARS: f64 = 1.524 * AU;
 const R_EARTH: f64 = 1.0 * AU;
 
-const ENGINE_ISP: f64 = 908.0;
-const ENGINE_THRUST: f64 = 8.912e3; // 8.8912 kN
+const ENGINE_ISP: f64 = 8185.0;
+const ENGINE_THRUST: f64 = 1.729e3; // 8.8912 kN
 const G_0: f64 = 9.81;
 const DRY_MASS: f64 = 300.0e3; // 500 mt
 const CARGO_MASS: f64 = 500.0e3; // 500 mt
@@ -63,75 +63,6 @@ fn main() {
         calculate_stage_initial_mass(exhaust_velocity, dv_mars, stage_1_m_initial);
 
     let m_dot = ENGINE_THRUST / exhaust_velocity;
-
-    let stage_0_propellant_used = stage_0_m_initial - stage_1_m_initial;
-    let stage_1_propellant_used = stage_1_m_initial - m_final;
-    let m_propellant = stage_0_m_initial - m_final;
-    // As mission planned.
-    println!("Propellant m_dot: {:.3} kg/s", m_dot);
-    println!("Total Propellant Mass: {:.3} mt", m_propellant / 1.0e3);
-    println!(
-        "Stage 0 Propellant Used: {:.3} mt",
-        stage_0_propellant_used / 1.0e3
-    );
-    println!(
-        "Stage 1 Propellant Used: {:.3} mt",
-        stage_1_propellant_used / 1.0e3
-    );
-    println!(
-        "Stage 0 Burn Time: {:.3} days",
-        (stage_0_propellant_used / m_dot) / 86_400.0
-    );
-    println!(
-        "Stage 1 Burn Time: {:.3} days",
-        (stage_1_propellant_used / m_dot) / 86_400.0
-    );
-
-    // Lose 75% of radiators.
-    let exhaust_velocity = 809.0 * G_0;
-
-    // Work backwards between every burn stage.
-    let m_final = DRY_MASS + CARGO_MASS;
-    let stage_1_m_initial = calculate_stage_initial_mass(exhaust_velocity, dv_earth, m_final);
-    let stage_0_m_initial =
-        calculate_stage_initial_mass(exhaust_velocity, dv_mars, stage_1_m_initial);
-
-    let m_dot = 7_936.0 / exhaust_velocity;
-
-    let stage_0_propellant_used = stage_0_m_initial - stage_1_m_initial;
-    let stage_1_propellant_used = stage_1_m_initial - m_final;
-    let m_propellant = stage_0_m_initial - m_final;
-    // As mission planned.
-    println!("Propellant m_dot: {:.3} kg/s", m_dot);
-    println!("Total Propellant Mass: {:.3} mt", m_propellant / 1.0e3);
-    println!(
-        "Stage 0 Propellant Used: {:.3} mt",
-        stage_0_propellant_used / 1.0e3
-    );
-    println!(
-        "Stage 1 Propellant Used: {:.3} mt",
-        stage_1_propellant_used / 1.0e3
-    );
-    println!(
-        "Stage 0 Burn Time: {:.3} days",
-        (stage_0_propellant_used / m_dot) / 86_400.0
-    );
-    println!(
-        "Stage 1 Burn Time: {:.3} days",
-        (stage_1_propellant_used / m_dot) / 86_400.0
-    );
-
-    // Back up using urea.
-    let exhaust_velocity = 697.0 * G_0;
-
-    // Work backwards between every burn stage.
-    // Assume 300 mt of Urea is used as propellant.
-    let m_final = DRY_MASS + CARGO_MASS - 300.0e3;
-    let stage_1_m_initial = calculate_stage_initial_mass(exhaust_velocity, dv_earth, m_final);
-    let stage_0_m_initial =
-        calculate_stage_initial_mass(exhaust_velocity, dv_mars, stage_1_m_initial);
-
-    let m_dot = 13_666.0 / exhaust_velocity;
 
     let stage_0_propellant_used = stage_0_m_initial - stage_1_m_initial;
     let stage_1_propellant_used = stage_1_m_initial - m_final;
