@@ -14,7 +14,7 @@ pub struct PropellantState {
     pub avg_cp: f64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Propellant<'a> {
     pub species: Vec<(
         f64,
@@ -85,8 +85,33 @@ impl<'a> Propellant<'a> {
                 species_mix.insert(key, o.clone());
             }
         }
-        let species = species_mix.drain().map(|(_, v)| v).collect();
+        let mut species = species_mix.drain().map(|(_, v)| v).collect::<Vec<(
+            f64,
+            Species,
+            &'a TemperatureDependentProperty,
+            Vec<(f64, Species, &'a TemperatureDependentProperty)>,
+        )>>();
+        species.sort_by(|a, b| a.1.symbol().cmp(&b.1.symbol()));
         Self { species }
+    }
+
+    pub fn scale(&self, factor: f64) -> Self {
+        Self {
+            species: self
+                .species
+                .iter()
+                .map(|(mol, sp, tdp, dis)| {
+                    (
+                        *mol * factor,
+                        *sp,
+                        *tdp,
+                        dis.iter()
+                            .map(|(d_mol, d_sp, d_tdp)| (*d_mol * 1.0, *d_sp, *d_tdp))
+                            .collect(),
+                    )
+                })
+                .collect(),
+        }
     }
 
     pub fn alphas(&self, temperature_k: f64, pressure_bar: f64) -> Vec<f64> {
@@ -253,6 +278,7 @@ pub enum Species {
     CO,
     N2,
     N,
+    H2O,
 }
 
 impl Species {
@@ -265,6 +291,7 @@ impl Species {
             Species::CO => "CO".to_string(),
             Species::N2 => "N2".to_string(),
             Species::N => "N".to_string(),
+            Species::H2O => "H2O".to_string(),
         }
     }
 
@@ -277,6 +304,7 @@ impl Species {
             Species::CO => CO_MW,
             Species::N2 => N2_MW,
             Species::N => N_MW,
+            Species::H2O => H2O_MW,
         }
     }
 }
