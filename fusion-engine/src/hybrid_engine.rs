@@ -115,6 +115,32 @@ fn solve_for_chamber_state(
     (chamber_state, t_chamber)
 }
 
+fn choked_throat_area(
+    m_dot: f64,
+    pressure_bar: f64,
+    temperature: f64,
+    gamma: f64,
+    avg_mw: f64,
+) -> f64 {
+    let r_specific = R / avg_mw;
+    let pressure_pa = pressure_bar * 1.0e5;
+    let choke_factor = (2.0 / (gamma + 1.0)).powf((gamma + 1.0) / (2.0 * (gamma - 1.0)));
+    m_dot / (pressure_pa * (gamma / (r_specific * temperature)).sqrt() * choke_factor)
+}
+
+fn choked_chamber_pressure_bar(
+    m_dot: f64,
+    area: f64,
+    temperature: f64,
+    gamma: f64,
+    avg_mw: f64,
+) -> f64 {
+    let r_specific = R / avg_mw;
+    let choke_factor = (2.0 / (gamma + 1.0)).powf((gamma + 1.0) / (2.0 * (gamma - 1.0)));
+    let pressure_pa = m_dot / (area * (gamma / (r_specific * temperature)).sqrt() * choke_factor);
+    pressure_pa / 1.0e5
+}
+
 fn calculate_engine_output(
     field_voltage: f64,
     collision_theta_deg: f64,
@@ -130,7 +156,8 @@ fn calculate_engine_output(
     funnel_length: f64,
     t_allowed_max_chamber: f64,
     coupling_efficiency: f64,
-) {
+    fixed_total_throat_area: Option<f64>,
+) -> (Option<f64>, Option<f64>) {
     // It is kind of like there are two exhaust streams.
     // 1) Accelerated stream that does not mix with the diluent. (1.0 - coupling_efficiency)
     // 2) Accelerated stream that mixes with the all diluent. coupling_efficiency
@@ -237,6 +264,12 @@ fn calculate_engine_output(
     // Nozzle expansion. Assume frozen flow for lower bound Isp.
     let exit_temperature = t_chamber_fast
         * (exit_pressure / chamber_pressure).powf((mixture_gamma - 1.0) / mixture_gamma);
+    // TODO actually get species data for lower numbers?
+    let exit_temperature = if exit_temperature < 300.0 {
+        300.0
+    } else {
+        exit_temperature
+    };
     let exit_state = fast_species.state(exit_temperature, exit_pressure);
     let total_pool_mass = propellant_mw * (1.0 - coupling_efficiency);
     // let total_pool_mass = propellant_mw + diluent.feed_mass();
@@ -274,6 +307,12 @@ fn calculate_engine_output(
     // Nozzle expansion. Assume frozen flow for lower bound Isp.
     let exit_temperature = t_chamber_slow
         * (exit_pressure / chamber_pressure).powf((mixture_gamma - 1.0) / mixture_gamma);
+    // TODO actually get species data for lower numbers?
+    let exit_temperature = if exit_temperature < 300.0 {
+        300.0
+    } else {
+        exit_temperature
+    };
     let slow_species = slow_species.mix(diluent);
     let exit_state = slow_species.state(exit_temperature, exit_pressure);
     let total_pool_mass = propellant_mw * coupling_efficiency + diluent.feed_mass();
@@ -363,12 +402,38 @@ fn calculate_engine_output(
     println!("Configured Gap Spacing: {:.3} mm", gap_spacing * 1.0e3);
     println!("Apertures Needed: {:.0}", apertures_needed);
 
-    println!("[Slow] Avg MW: {:.4} kg/mol", chamber_slow_state.avg_mw);
-    println!("[Slow] Gamma: {:.4}", mixture_gamma);
-    println!(
-        "[Slow] Mass flow: {:.3} g/s",
-        (propellant_m_dot * coupling_efficiency + diluent_m_dot) * 1.0e3
-    );
+    // Nozzle Design
+    let slow_m_dot = propellant_m_dot * coupling_efficiency + diluent_m_dot;
+    let results = if let Some(fixed_area) = fixed_total_throat_area {
+        let available_annulus_area = fixed_area - max_channel_area;
+        let actual_chamber_pressure = choked_chamber_pressure_bar(
+            slow_m_dot,
+            available_annulus_area,
+            t_chamber_slow,
+            mixture_gamma,
+            chamber_slow_state.avg_mw,
+        );
+        println!(
+            "Actual Chamber Pressure: {:.3} bar",
+            actual_chamber_pressure
+        );
+        (Some(actual_chamber_pressure), None)
+    } else {
+        let annulus_area_design = choked_throat_area(
+            slow_m_dot,
+            chamber_pressure,
+            t_chamber_slow,
+            mixture_gamma,
+            chamber_slow_state.avg_mw,
+        );
+        let fixed_total_area_throat = max_channel_area + annulus_area_design;
+        println!(
+            "Fixed Throat Area: {:.3} mm^2",
+            fixed_total_area_throat * 1.0e6
+        );
+        (None, Some(fixed_total_area_throat))
+    };
+    results
 }
 
 // TODO thermo reference for water at higher temperatures?
@@ -378,6 +443,18 @@ fn calculate_engine_output(
 // Waste heat needs to account for this loss, and loss from fusion to electricity, and
 // the heat from disassociation and water electrolysis
 pub fn sweep_engine() {
+    let voltage = 400.0;
+    let collision_theta_deg = 5.0;
+    let engine_power = 50.0e6;
+    let t_mixture_start = 300.0;
+    let t_diluent_start = 1_000.0;
+    let target_area_ratio = 100.0;
+    let gap_spacing = 0.05e-3;
+    let aperture_diameter = 0.5e-3;
+    let funnel_length = 7.0; // meters
+    let t_allowed_max_chamber = 6_000.0; // When using water diluent
+    let chamber_pressure = 25.0;
+
     let thermo_reference = ThermoReference::new();
     let propellant = Propellant::new(
         &thermo_reference,
@@ -386,22 +463,45 @@ pub fn sweep_engine() {
             (2.0, Species::H2, vec![(2.0, Species::H)]),
         ],
     );
+
+    let diluent = Propellant::new(
+        &thermo_reference,
+        vec![
+            (1.0, Species::H2, vec![(2.0, Species::H)]),
+            (
+                5.0,
+                Species::H2O,
+                vec![(1.0, Species::H2), (1.0, Species::O)],
+            ),
+        ],
+    );
+
+    let coupling_efficiency = 0.03; // Higher because chamber has 6 moles of diluent plus disassociation
+    let fixed_total_throat_area = None; // Derive area
+    println!("===== Thrust Mode =====");
+    calculate_engine_output(
+        voltage,
+        collision_theta_deg,
+        engine_power,
+        t_mixture_start,
+        t_diluent_start,
+        chamber_pressure,
+        target_area_ratio,
+        &propellant,
+        &diluent,
+        gap_spacing,
+        aperture_diameter,
+        funnel_length,
+        t_allowed_max_chamber,
+        coupling_efficiency,
+        fixed_total_throat_area,
+    );
+
     let diluent = Propellant::new(
         &thermo_reference,
         vec![(1.0, Species::H2, vec![(2.0, Species::H)])],
     );
 
-    let voltage = 400.0;
-    let collision_theta_deg = 5.0;
-    let engine_power = 50.0e6;
-    let t_mixture_start = 300.0;
-    let t_diluent_start = 1_000.0;
-    let chamber_pressure = 25.0;
-    let target_area_ratio = 100.0;
-    let gap_spacing = 0.05e-3;
-    let aperture_diameter = 0.5e-3;
-    let funnel_length = 7.0; // meters
-    let t_allowed_max_chamber = 6_000.0; // When using water diluent
     let coupling_efficiency = 0.005; // Lower because chamber only has 1 mole H2
     println!("===== Isp Mode =====");
     calculate_engine_output(
@@ -419,47 +519,6 @@ pub fn sweep_engine() {
         funnel_length,
         t_allowed_max_chamber,
         coupling_efficiency,
-    );
-
-    let diluent = Propellant::new(
-        &thermo_reference,
-        vec![
-            (1.0, Species::H2, vec![(2.0, Species::H)]),
-            (
-                5.0,
-                Species::H2O,
-                vec![(1.0, Species::H2), (1.0, Species::O)],
-            ),
-        ],
-    );
-
-    let voltage = 400.0;
-    let collision_theta_deg = 5.0;
-    let engine_power = 50.0e6;
-    let t_mixture_start = 300.0;
-    let t_diluent_start = 1_000.0;
-    let chamber_pressure = 25.0;
-    let target_area_ratio = 100.0;
-    let gap_spacing = 0.05e-3;
-    let aperture_diameter = 0.5e-3;
-    let funnel_length = 7.0; // meters
-    let t_allowed_max_chamber = 6_000.0; // When using water diluent
-    let coupling_efficiency = 0.03; // Higher because chamber has 6 moles of diluent plus disassociation
-    println!("===== Thrust Mode =====");
-    calculate_engine_output(
-        voltage,
-        collision_theta_deg,
-        engine_power,
-        t_mixture_start,
-        t_diluent_start,
-        chamber_pressure,
-        target_area_ratio,
-        &propellant,
-        &diluent,
-        gap_spacing,
-        aperture_diameter,
-        funnel_length,
-        t_allowed_max_chamber,
-        coupling_efficiency,
+        None,
     );
 }
