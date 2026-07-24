@@ -472,7 +472,7 @@ pub fn sweep_engine() {
     let diluent = Mixture::new(
         &tr,
         vec![(1.0, Species::H2), (5.0, Species::H2O)],
-        20_000.0,
+        7_000.0,
         25.0,
     );
     println!("Diluent Products");

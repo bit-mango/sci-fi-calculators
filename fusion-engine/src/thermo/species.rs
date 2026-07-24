@@ -319,6 +319,9 @@ impl Mixture {
 
     pub fn print_products(&self) {
         for (mole, species) in self.products.iter() {
+            if *mole < 1.0e-2 {
+                continue;
+            }
             println!("{:.2} {}", mole, species.symbol());
         }
     }
