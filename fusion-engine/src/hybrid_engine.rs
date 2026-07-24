@@ -1,10 +1,9 @@
+use crate::constants::*;
 use crate::nozzle::area_ratio::exit_pressure_from_area_ratio;
-use crate::nozzle::propellant::PropellantState;
 use crate::thermo::fluid_properties::ThermoReference;
-use crate::{constants::*, nozzle::propellant};
 use std::f64::consts::PI;
 
-use crate::nozzle::propellant::{Propellant, Species};
+use crate::thermo::species::{Mixture, MixtureState, Species};
 
 fn required_max_channel_area(
     n_dot_reaction: f64,
@@ -57,22 +56,23 @@ fn funnel_convergence_half_angle_deg(
 }
 
 fn solve_for_chamber_state(
+    tr: &ThermoReference,
     t_ions_start: f64,
     t_diluent_start: f64,
     t_allowed_max_chamber: f64,
     chamber_pressure: f64,
     q_chamber: f64,
-    ions: &Propellant,
-    diluent: Option<&Propellant>,
-) -> (PropellantState, f64) {
+    ions: &Mixture,
+    diluent: Option<&Mixture>,
+) -> (MixtureState, f64) {
     let mut t_low = t_ions_start;
     let mut t_high = t_allowed_max_chamber;
     let mut t_chamber = t_low + (t_high - t_low) / 2.0;
     // Ions and diluent can start out at different temperatures, so
     // get initial state separately.
-    let mixture_start_state = ions.state(t_ions_start, chamber_pressure);
+    let mixture_start_state = ions.state(t_ions_start, chamber_pressure, tr);
     let diluent_start_h = if let Some(d) = diluent {
-        d.state(t_diluent_start, chamber_pressure).h_total
+        d.state(t_diluent_start, chamber_pressure, tr).h_total
     } else {
         0.0
     };
@@ -84,10 +84,10 @@ fn solve_for_chamber_state(
         ions
     };
 
-    let mut chamber_state = PropellantState::default();
+    let mut chamber_state = MixtureState::default();
 
     for i in 0..200 {
-        chamber_state = mixture.state(t_chamber, chamber_pressure);
+        chamber_state = mixture.state(t_chamber, chamber_pressure, tr);
 
         let delta_enthalpy = chamber_state.h_total - starting_enthalpy;
 
@@ -142,6 +142,7 @@ fn choked_chamber_pressure_bar(
 }
 
 fn calculate_engine_output(
+    tr: &ThermoReference,
     field_voltage: f64,
     collision_theta_deg: f64,
     engine_power: f64,
@@ -149,8 +150,8 @@ fn calculate_engine_output(
     t_diluent_start: f64,
     chamber_pressure: f64,
     target_area_ratio: f64,
-    propellant: &Propellant,
-    diluent: &Propellant,
+    propellant: &Mixture,
+    diluent: &Mixture,
     gap_spacing: f64,
     aperture_diameter: f64,
     funnel_length: f64,
@@ -195,7 +196,7 @@ fn calculate_engine_output(
         (2.0 * electrostatic_energy / collision_species_mw).sqrt() * collision_theta_rad.cos();
 
     // Accelerated species enter chamber, where some of them can slam into diluent.
-    let diluent_state_start = diluent.state(t_mixture_start, chamber_pressure);
+    let diluent_state_start = diluent.state(t_mixture_start, chamber_pressure, tr);
     let diluent_m_dot =
         (diluent_state_start.n_total * diluent_state_start.avg_mw * propellant_n_dot).abs();
     let entrained_ion_m_dot = coupling_efficiency * propellant_m_dot;
@@ -232,6 +233,7 @@ fn calculate_engine_output(
 
     let fast_species = propellant.scale(1.0 - coupling_efficiency);
     let (chamber_fast_state, t_chamber_fast) = solve_for_chamber_state(
+        tr,
         t_mixture_start,
         t_diluent_start,
         20_000.0,
@@ -242,6 +244,7 @@ fn calculate_engine_output(
     );
     let slow_species = propellant.scale(coupling_efficiency);
     let (chamber_slow_state, t_chamber_slow) = solve_for_chamber_state(
+        tr,
         t_mixture_start,
         t_diluent_start,
         t_allowed_max_chamber,
@@ -270,7 +273,7 @@ fn calculate_engine_output(
     } else {
         exit_temperature
     };
-    let exit_state = fast_species.state(exit_temperature, exit_pressure);
+    let exit_state = fast_species.state(exit_temperature, exit_pressure, tr);
     let total_pool_mass = propellant_mw * (1.0 - coupling_efficiency);
     // let total_pool_mass = propellant_mw + diluent.feed_mass();
     let v_heat = (2.0 * (chamber_fast_state.h_total - exit_state.h_total) / total_pool_mass).sqrt();
@@ -282,13 +285,13 @@ fn calculate_engine_output(
     let fast_engine_thrust = v_e * (propellant_m_dot * (1.0 - coupling_efficiency));
 
     println!("[Fast] Chamber Temperature: {:.3} K", t_chamber_fast);
-    for (i, specie) in propellant.species.iter().enumerate() {
-        println!(
-            "[Fast] ⍺ {}: {:.2} %",
-            specie.1.symbol(),
-            chamber_fast_state.alphas[i] * 100.0
-        );
-    }
+    // for (i, specie) in propellant.species.iter().enumerate() {
+    //     println!(
+    //         "[Fast] ⍺ {}: {:.2} %",
+    //         specie.1.symbol(),
+    //         chamber_fast_state.alphas[i] * 100.0
+    //     );
+    // }
     println!("[Fast] Electrostatic Isp: {:.0} s", fast_electrostatic_isp);
     println!("[Fast] Combustion Isp: {:.0} s", fast_ecombustion_isp);
     println!("[Fast] Isp: {:.0} s", fast_isp);
@@ -314,7 +317,7 @@ fn calculate_engine_output(
         exit_temperature
     };
     let slow_species = slow_species.mix(diluent);
-    let exit_state = slow_species.state(exit_temperature, exit_pressure);
+    let exit_state = slow_species.state(exit_temperature, exit_pressure, tr);
     let total_pool_mass = propellant_mw * coupling_efficiency + diluent.feed_mass();
     let v_heat = (2.0 * (chamber_slow_state.h_total - exit_state.h_total) / total_pool_mass).sqrt();
     let v_e = v_common + v_heat;
@@ -325,13 +328,13 @@ fn calculate_engine_output(
     let slow_engine_thrust = v_e * (propellant_m_dot * coupling_efficiency + diluent_m_dot);
 
     println!("[Slow] Chamber Temperature: {:.3} K", t_chamber_slow);
-    for (i, specie) in slow_species.species.iter().enumerate() {
-        println!(
-            "[Slow] ⍺ {}: {:.2} %",
-            specie.1.symbol(),
-            chamber_slow_state.alphas[i] * 100.0
-        );
-    }
+    // for (i, specie) in slow_species.species.iter().enumerate() {
+    //     println!(
+    //         "[Slow] ⍺ {}: {:.2} %",
+    //         specie.1.symbol(),
+    //         chamber_slow_state.alphas[i] * 100.0
+    //     );
+    // }
     println!("[Slow] Electrostatic Isp: {:.0} s", slow_electrostatic_isp);
     println!("[Slow] Combustion Isp: {:.0} s", slow_combustion_isp);
     println!("[Slow] Isp: {:.0} s", slow_isp);
@@ -452,34 +455,24 @@ pub fn sweep_engine() {
     let gap_spacing = 0.05e-3;
     let aperture_diameter = 0.5e-3;
     let funnel_length = 7.0; // meters
-    let t_allowed_max_chamber = 6_000.0; // When using water diluent
+    let t_allowed_max_chamber = 20_000.0; // When using water diluent
     let chamber_pressure = 25.0;
-
     let thermo_reference = ThermoReference::new();
-    let propellant = Propellant::new(
-        &thermo_reference,
-        vec![
-            (1.0, Species::CO, vec![(1.0, Species::C), (1.0, Species::O)]),
-            (2.0, Species::H2, vec![(2.0, Species::H)]),
-        ],
-    );
 
-    let diluent = Propellant::new(
-        &thermo_reference,
-        vec![
-            (1.0, Species::H2, vec![(2.0, Species::H)]),
-            (
-                5.0,
-                Species::H2O,
-                vec![(1.0, Species::H2), (1.0, Species::O)],
-            ),
-        ],
-    );
+    let propellant = Mixture::new(vec![(1.0, Species::CO), (2.0, Species::H2)]);
+    let diluent = Mixture::new(vec![(1.0, Species::H2), (5.0, Species::H2O)]);
+
+    println!("Trying to find solution!");
+    propellant.state(3_000.0, 25.0, &thermo_reference);
+    println!("Solution Found!");
+
+    todo!();
 
     let coupling_efficiency = 0.03; // Higher because chamber has 6 moles of diluent plus disassociation
     let fixed_total_throat_area = None; // Derive area
     println!("===== Thrust Mode =====");
     calculate_engine_output(
+        &thermo_reference,
         voltage,
         collision_theta_deg,
         engine_power,
@@ -497,14 +490,12 @@ pub fn sweep_engine() {
         fixed_total_throat_area,
     );
 
-    let diluent = Propellant::new(
-        &thermo_reference,
-        vec![(1.0, Species::H2, vec![(2.0, Species::H)])],
-    );
+    let diluent = Mixture::new(vec![(1.0, Species::H2)]);
 
     let coupling_efficiency = 0.005; // Lower because chamber only has 1 mole H2
     println!("===== Isp Mode =====");
     calculate_engine_output(
+        &thermo_reference,
         voltage,
         collision_theta_deg,
         engine_power,

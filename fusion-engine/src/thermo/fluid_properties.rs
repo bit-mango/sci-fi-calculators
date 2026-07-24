@@ -1,6 +1,7 @@
 use crate::constants::R;
 use std::{fmt, fs};
 
+#[derive(Clone, Copy)]
 pub struct PolynomialCoefficients {
     pub a_1: f64,
     pub a_2: f64,
@@ -96,16 +97,32 @@ impl TemperatureDependentProperty {
         self.coefficients.push(pc);
     }
 
-    fn find_coefficients(&self, temperature_k: f64) -> Option<&PolynomialCoefficients> {
-        self.coefficients.iter().find(|&coefficients| {
-            coefficients.min_temperature <= temperature_k
-                && coefficients.max_temperature >= temperature_k
-        })
+    // This assumes coefficients ranges come in ascending order of temperature.
+    fn find_coefficients(&self, temperature_k: f64) -> &PolynomialCoefficients {
+        // Check if temperature_k is greater than the maximum range we have.
+        if let Some(last) = self.coefficients.last() {
+            if temperature_k >= last.max_temperature {
+                return last;
+            }
+        }
+        // Check if temperature_k is less than the minimum range we have.
+        if let Some(first) = self.coefficients.first() {
+            if temperature_k <= first.min_temperature {
+                return first;
+            }
+        }
+        // Falls within a range we have.
+        for coeff in self.coefficients.iter() {
+            if temperature_k >= coeff.min_temperature && temperature_k <= coeff.max_temperature {
+                return coeff;
+            }
+        }
+
+        panic!("Not sure how we got here");
     }
+
     pub fn cp(&self, temperature_k: f64) -> f64 {
-        let c = self.find_coefficients(temperature_k).expect(&format!(
-            "Could not find coefficients for temperature_k {temperature_k}"
-        ));
+        let c = self.find_coefficients(temperature_k);
         let t_1 = temperature_k;
         let t_2 = t_1 * t_1;
         let t_3 = t_2 * t_1;
@@ -123,9 +140,7 @@ impl TemperatureDependentProperty {
     }
 
     pub fn h(&self, temperature_k: f64) -> f64 {
-        let c = self.find_coefficients(temperature_k).expect(&format!(
-            "Could not find coefficients for temperature_k {temperature_k}"
-        ));
+        let c = self.find_coefficients(temperature_k);
         let t_1 = temperature_k;
         let t_2 = t_1 * t_1;
         let t_3 = t_2 * t_1;
@@ -144,9 +159,7 @@ impl TemperatureDependentProperty {
     }
 
     pub fn s(&self, temperature_k: f64) -> f64 {
-        let c = self.find_coefficients(temperature_k).expect(&format!(
-            "Could not find coefficients for temperature_k {temperature_k}"
-        ));
+        let c = self.find_coefficients(temperature_k);
         let t_1 = temperature_k;
         let t_2 = t_1 * t_1;
         let t_3 = t_2 * t_1;
@@ -165,6 +178,7 @@ impl TemperatureDependentProperty {
 }
 
 use std::collections::HashMap;
+#[derive(Default)]
 pub struct ThermoReference {
     reference: HashMap<String, TemperatureDependentProperty>,
 }

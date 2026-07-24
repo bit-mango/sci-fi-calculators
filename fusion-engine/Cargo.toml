@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 integrate = "0.3.1"
+nalgebra = "0.35.0"
