@@ -28,10 +28,10 @@ pub struct Mixture {
 }
 
 impl Mixture {
-    // TODO reaction_pool and species_pool is unchanged from walk to walk, so claculate once and pass in .
+    // TODO add a new method that accepts some initial pi and ln_n guess for carry voer work?
     pub fn new(
         tr: &ThermoReference,
-        reactants: Vec<(f64, Species)>,
+        reactants: &Vec<(f64, Species)>,
         temperature_k: f64,
         pressure_bar: f64,
     ) -> Self {
@@ -318,6 +318,7 @@ impl Mixture {
     }
 
     pub fn print_products(&self) {
+        println!("Products Temperature: {:.3} K", self.temperature_k);
         for (mole, species) in self.products.iter() {
             if *mole < 1.0e-2 {
                 continue;
@@ -326,32 +327,110 @@ impl Mixture {
         }
     }
 
-    // Should balance enthalpies? So each mixture can be at a different temperature, but must be isobaric
-    // then do a bissection
-    pub fn mix(&self, other: &Self) -> Self {
-        todo!()
-        // let mut reatants_mix: HashMap<String, (f64, Species)> = HashMap::new();
-        // // Add all of original reatants to mix.
-        // for s in self.reactants.iter() {
-        //     let key = s.1.symbol();
-        //     reatants_mix.insert(key, s.clone());
-        // }
-        // for o in other.reactants.iter() {
-        //     let key = o.1.symbol();
-        //     if let Some(entry) = reatants_mix.get_mut(&key) {
-        //         // reatants already exists! Increment moles.
-        //         entry.0 += o.0;
-        //     } else {
-        //         // reatants is new, add them.
-        //         reatants_mix.insert(key, o.clone());
-        //     }
-        // }
-        // let mut reactants = reatants_mix
-        //     .drain()
-        //     .map(|(_, v)| v)
-        //     .collect::<Vec<(f64, Species)>>();
-        // reactants.sort_by(|a, b| a.1.symbol().cmp(&b.1.symbol()));
-        // Self { reactants }
+    pub fn mix(&self, tr: &ThermoReference, other: &Self) -> Self {
+        let starting_h = self.h_total + other.h_total;
+        if self.pressure_bar != other.pressure_bar {
+            panic!("Must be Isobaric to mix!");
+        }
+        let pressure_bar = self.pressure_bar;
+
+        // Before mixing, bring the colder mix up to the same temperature as the hotter mix
+        // for better initial guesses.
+        let (cold, hot) = if self.temperature_k <= other.temperature_k {
+            (self, other)
+        } else {
+            (other, self)
+        };
+
+        let cold_adj = if self.temperature_k == other.temperature_k {
+            // Already same temperature nothing to do.
+            cold
+        } else {
+            // Calculate new cold mixture products
+            &Mixture::new(tr, &cold.products, hot.temperature_k, pressure_bar)
+        };
+
+        // Create reactant mix using adjusted other.
+        let mut reatants_mix: HashMap<String, (f64, Species)> = HashMap::new();
+        // Add all of original reatants to mix.
+        for s in hot.products.iter() {
+            let key = s.1.symbol();
+            reatants_mix.insert(key, s.clone());
+        }
+        for o in cold_adj.products.iter() {
+            let key = o.1.symbol();
+            if let Some(entry) = reatants_mix.get_mut(&key) {
+                // reatants already exists! Increment moles.
+                entry.0 += o.0;
+            } else {
+                // reatants is new, add them.
+                reatants_mix.insert(key, o.clone());
+            }
+        }
+        let mut reactants = reatants_mix
+            .drain()
+            .map(|(_, v)| v)
+            .collect::<Vec<(f64, Species)>>();
+        reactants.sort_by(|a, b| a.1.symbol().cmp(&b.1.symbol()));
+
+        // Find a bracket where f(T) = h(T) - starting_h changes sign
+        let step = 500.0;
+        // Walk down from the hot temperature.
+        let mut t_low = hot.temperature_k;
+        let mut low_scratch = Mixture::new(tr, &reactants, t_low, pressure_bar);
+        let mut f_low = low_scratch.h_total - starting_h;
+        while f_low > 0.0 && t_low > 200.0 {
+            let next_t = (t_low - step).max(200.0);
+            low_scratch = Mixture::new(tr, &low_scratch.products, next_t, pressure_bar);
+            t_low = next_t;
+            f_low = low_scratch.h_total - starting_h;
+        }
+        // Walk up from the hot temperature.
+        let mut t_high = hot.temperature_k;
+        let mut high_scratch = Mixture::new(tr, &reactants, t_high, pressure_bar);
+        let mut f_high = high_scratch.h_total - starting_h;
+        while f_high < 0.0 && t_high < 20_000.0 {
+            let next_t = (t_high + step).min(20_000.0);
+            high_scratch = Mixture::new(tr, &high_scratch.products, next_t, pressure_bar);
+            t_high = next_t;
+            f_high = high_scratch.h_total - starting_h;
+        }
+
+        if f_low > 0.0 || f_high < 0.0 {
+            panic!("Could not bracket adiabatic mix temperature");
+        }
+
+        // Now determine actual new mix
+        let mut t = t_low + (t_high - t_low) / 2.0;
+        let mut iterations = 0;
+        let mut mixed_products = None;
+        while iterations < 100 {
+            if (t_high - t_low).abs() < 1.0e-6 {
+                mixed_products = Some(low_scratch);
+                break;
+            }
+            let seed = if (t - t_low).abs() <= (t_high - t).abs() {
+                &low_scratch.products
+            } else {
+                &high_scratch.products
+            };
+            let mid_scratch = Mixture::new(tr, seed, t, pressure_bar);
+            let f_mid = mid_scratch.h_total - starting_h;
+
+            if f_mid < 0.0 {
+                // Raise temperature
+                t_low = t;
+                low_scratch = mid_scratch;
+            } else {
+                // Lower temperature
+                t_high = t;
+                high_scratch = mid_scratch;
+            }
+            t = t_low + (t_high - t_low) / 2.0;
+            iterations += 1;
+        }
+
+        mixed_products.expect("Failed to mix products")
     }
 
     pub fn scale(&self, tr: &ThermoReference, factor: f64) -> Self {
@@ -521,6 +600,9 @@ impl Mixture {
         // Base ln_n_guess off of starting moles of the system.
         let ln_n_guess = products.iter().map(|(moles, _)| *moles).sum::<f64>().ln();
 
+        let total_moles: f64 = products.iter().map(|(moles, _)| *moles).sum();
+        let threshold = 1.0e-9; // relative to total system moles.
+
         // Identify anchor species.
         let anchors: Vec<(usize, f64)> = species_pool
             .iter()
@@ -528,7 +610,7 @@ impl Mixture {
             .map(|(i, species)| {
                 let mut anchors_i = None;
                 for (moles, reactant) in products.iter() {
-                    if reactant == species {
+                    if reactant == species && *moles / total_moles > threshold {
                         anchors_i = Some((i, *moles));
                     }
                 }
@@ -638,7 +720,7 @@ fn residual_and_jacobian(
     (n_vec, f_vec, j_matrix)
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Species {
     H,
     H2,

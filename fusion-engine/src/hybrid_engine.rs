@@ -463,22 +463,18 @@ pub fn sweep_engine() {
 
     let propellant = Mixture::new(
         &tr,
-        vec![(1.0, Species::CO), (2.0, Species::H2)],
-        300.0,
+        &vec![(1.0, Species::CO), (2.0, Species::H2)],
+        20_000.0,
         25.0,
     );
-    println!("Propellant Products");
-    propellant.print_products();
     let diluent = Mixture::new(
         &tr,
-        vec![(1.0, Species::H2), (5.0, Species::H2O)],
-        7_000.0,
+        &vec![(1.0, Species::H2), (5.0, Species::H2O)],
+        200.0,
         25.0,
     );
-    println!("Diluent Products");
-    diluent.print_products();
-
-    todo!();
+    let mixed = propellant.mix(&tr, &diluent);
+    mixed.print_products();
 
     let coupling_efficiency = 0.03; // Higher because chamber has 6 moles of diluent plus disassociation
     let fixed_total_throat_area = None; // Derive area
@@ -502,7 +498,7 @@ pub fn sweep_engine() {
         fixed_total_throat_area,
     );
 
-    let diluent = Mixture::new(&tr, vec![(1.0, Species::H2)], 1_000.0, 25.0);
+    let diluent = Mixture::new(&tr, &vec![(1.0, Species::H2)], 1_000.0, 25.0);
 
     let coupling_efficiency = 0.005; // Lower because chamber only has 1 mole H2
     println!("===== Isp Mode =====");
