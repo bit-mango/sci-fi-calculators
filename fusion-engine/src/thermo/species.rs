@@ -18,91 +18,24 @@ pub struct MixtureState {
 
 #[derive(Clone, Default)]
 pub struct Mixture {
-    pub reactants: Vec<(f64, Species)>, // moles, species, Temperature Dependent Property
+    pub products: Vec<(f64, Species)>,
+    pub temperature_k: f64,
+    pub pressure_bar: f64,
+    pub h_total: f64, // Total enthalpy.
+    pub s_total: f64, // Total entropy.
+    pub avg_mw: f64,
+    pub avg_cp: f64,
 }
 
 impl Mixture {
-    pub fn new(reactants: Vec<(f64, Species)>) -> Self {
-        Self { reactants }
-    }
-
-    pub fn mix(&self, other: &Self) -> Self {
-        let mut reatants_mix: HashMap<String, (f64, Species)> = HashMap::new();
-        // Add all of original reatants to mix.
-        for s in self.reactants.iter() {
-            let key = s.1.symbol();
-            reatants_mix.insert(key, s.clone());
-        }
-        for o in other.reactants.iter() {
-            let key = o.1.symbol();
-            if let Some(entry) = reatants_mix.get_mut(&key) {
-                // reatants already exists! Increment moles.
-                entry.0 += o.0;
-            } else {
-                // reatants is new, add them.
-                reatants_mix.insert(key, o.clone());
-            }
-        }
-        let mut reactants = reatants_mix
-            .drain()
-            .map(|(_, v)| v)
-            .collect::<Vec<(f64, Species)>>();
-        reactants.sort_by(|a, b| a.1.symbol().cmp(&b.1.symbol()));
-        Self { reactants }
-    }
-
-    pub fn scale(&self, factor: f64) -> Self {
-        Self {
-            reactants: self
-                .reactants
-                .iter()
-                .map(|(mol, sp)| (*mol * factor, *sp))
-                .collect(),
-        }
-    }
-
-    pub fn reaction_pool(&self) -> (Vec<Species>, Vec<(f64, Species)>) {
-        let mut element_pool: HashMap<Species, f64> = HashMap::new();
-        self.reactants
-            .iter()
-            .for_each(|(parent_moles, parent_species)| {
-                let children = parent_species.constituents();
-                children.iter().for_each(|(child_moles, child_species)| {
-                    if let Some(existing) = element_pool.get_mut(child_species) {
-                        *existing += parent_moles * child_moles;
-                    } else {
-                        element_pool.insert(*child_species, parent_moles * child_moles);
-                    }
-                });
-            });
-        // Filter out any species we don't have constituent elements for.
-        let species_pool = Species::all()
-            .iter()
-            .filter(|species| {
-                let children = species.constituents();
-                for child in children {
-                    if !element_pool.contains_key(&child.1) {
-                        return false;
-                    }
-                }
-                return true;
-            })
-            .map(|s| *s)
-            .collect::<Vec<Species>>();
-        let element_pool = element_pool
-            .drain()
-            .map(|(species, moles)| (moles, species))
-            .collect::<Vec<(f64, Species)>>();
-        (species_pool, element_pool)
-    }
-
-    pub fn solve_for_products(
-        &self,
+    // TODO reaction_pool and species_pool is unchanged from walk to walk, so claculate once and pass in .
+    pub fn new(
+        tr: &ThermoReference,
+        reactants: Vec<(f64, Species)>,
         temperature_k: f64,
         pressure_bar: f64,
-        tr: &ThermoReference,
-    ) -> Mixture {
-        let (species_pool, element_pool) = self.reaction_pool();
+    ) -> Self {
+        let (species_pool, element_pool) = Self::reaction_pool(&reactants);
         // Precompute mu_not.
         let mu_not = species_pool
             .iter()
@@ -139,6 +72,349 @@ impl Mixture {
             })
             .collect::<Vec<Vec<f64>>>();
 
+        let j_len = a[0].len();
+        // b_j is element_pool[j].0
+        let b = element_pool
+            .iter()
+            .map(|(moles, _)| *moles)
+            .collect::<Vec<f64>>();
+        // Compute products given reactants and temperature_k.
+        // Compute guesses.
+        let (pi, ln_n) = Self::guess_pi_and_ln_n(
+            &reactants,
+            temperature_k,
+            pressure_bar,
+            j_len,
+            &a,
+            &mu_not,
+            &species_pool,
+        );
+        // Find the anchor, try target temperature first, if that fails iterate up and down from it.
+        let products = if let Some(ap) = Self::solve_for_products(
+            tr,
+            temperature_k,
+            pressure_bar,
+            &pi,
+            ln_n,
+            &species_pool,
+            &a,
+            &b,
+        ) {
+            ap.0
+        } else {
+            // Couldn't find anchor products so now recursively iterate to find the anchor, the walk it toward temperature_k
+            let mut t_low = (temperature_k - (temperature_k % 1_000.0)).max(200.0);
+            let mut t_high = t_low + 1_000.0;
+            let mut anchor = None;
+            let mut anchor_temperature_k = 0.0;
+
+            while t_low > 200.0 || t_high < 20_000.0 {
+                // Try t_low.
+                let low_anchor = Self::solve_for_products(
+                    tr,
+                    t_low,
+                    pressure_bar,
+                    &pi,
+                    ln_n,
+                    &species_pool,
+                    &a,
+                    &b,
+                );
+                if low_anchor.is_some() {
+                    anchor = low_anchor;
+                    anchor_temperature_k = t_low;
+                    break;
+                } else {
+                    // Try t_high.
+                    let high_anchor = Self::solve_for_products(
+                        tr,
+                        t_high,
+                        pressure_bar,
+                        &pi,
+                        ln_n,
+                        &species_pool,
+                        &a,
+                        &b,
+                    );
+                    if high_anchor.is_some() {
+                        anchor = high_anchor;
+                        anchor_temperature_k = t_high;
+                        break;
+                    } else {
+                        // Neither worked, adjust t_low, and t_high.
+                        t_low = (t_low - 1_000.0).max(200.0);
+                        t_high = (t_high + 1_000.0).min(20_000.0);
+                    }
+                }
+            }
+            let mut products = None;
+            if let Some(anc) = anchor {
+                // Now walk the anchor some max iterations.
+                let mut anc = anc;
+                let mut anchor_iterations = 0;
+                while anchor_iterations < 20 {
+                    let next_anchor = Self::walk_anchor(
+                        tr,
+                        anchor_temperature_k,
+                        &anc.1,
+                        anc.2,
+                        &species_pool,
+                        &a,
+                        &b,
+                        temperature_k,
+                        pressure_bar,
+                    );
+                    if let Some(next) = next_anchor {
+                        if next.3 == temperature_k {
+                            // We are done!
+                            products = Some(next.0);
+                        } else {
+                            anc.0 = next.0;
+                            anc.1 = next.1;
+                            anc.2 = next.2;
+                            anchor_temperature_k = next.3;
+                        }
+                    } else {
+                        panic!(
+                            "Could not converge to answer!
+                                Temperature wanted: {:.3} K
+                                Temperature walked to: {:.3} K",
+                            temperature_k, anchor_temperature_k
+                        )
+                    }
+
+                    anchor_iterations += 1;
+                }
+            } else {
+                panic!("Unable to find anchor point!");
+            }
+            products.unwrap()
+        };
+        // every 1_000 K until we find a solution. This is our anchor
+        // Move the anchor closer to temperature_k until we get it backing off half the distance on fail.
+        let (h_total, s_total, avg_mw, avg_cp) =
+            Self::state(tr, &products, temperature_k, pressure_bar);
+
+        Self {
+            products,
+            temperature_k,
+            pressure_bar,
+            h_total,
+            s_total,
+            avg_mw,
+            avg_cp,
+        }
+    }
+
+    fn walk_anchor(
+        tr: &ThermoReference,
+        anchor_temperature_k: f64,
+        anchor_pi: &Vec<f64>,
+        anchor_ln_n: f64,
+        species_pool: &Vec<Species>,
+        a: &Vec<Vec<f64>>,
+        b: &Vec<f64>,
+        temperature_k: f64,
+        pressure_bar: f64,
+    ) -> Option<(Vec<(f64, Species)>, Vec<f64>, f64, f64)> {
+        // Try solving temperature_k.
+        let result = if let Some(result) = Self::solve_for_products(
+            tr,
+            temperature_k,
+            pressure_bar,
+            anchor_pi,
+            anchor_ln_n,
+            &species_pool,
+            &a,
+            &b,
+        ) {
+            Some((result.0, result.1, result.2, temperature_k))
+        } else {
+            if (anchor_temperature_k - temperature_k).abs() < 1.0e-3 {
+                None
+            } else {
+                let midpoint = (anchor_temperature_k - temperature_k).abs() / 2.0
+                    + anchor_temperature_k.min(temperature_k);
+
+                Self::walk_anchor(
+                    tr,
+                    anchor_temperature_k,
+                    anchor_pi,
+                    anchor_ln_n,
+                    species_pool,
+                    a,
+                    b,
+                    midpoint,
+                    pressure_bar,
+                )
+            }
+        };
+
+        result
+    }
+
+    // Assumes reactants == products
+    pub fn new_with_frozen_reactants(
+        tr: &ThermoReference,
+        reactants: Vec<(f64, Species)>,
+        temperature_k: f64,
+        pressure_bar: f64,
+    ) -> Self {
+        let products = reactants;
+
+        let (h_total, s_total, avg_mw, avg_cp) =
+            Self::state(tr, &products, temperature_k, pressure_bar);
+
+        Self {
+            products,
+            temperature_k,
+            pressure_bar,
+            h_total,
+            s_total,
+            avg_mw,
+            avg_cp,
+        }
+    }
+
+    fn state(
+        tr: &ThermoReference,
+        products: &Vec<(f64, Species)>,
+        temperature_k: f64,
+        pressure_bar: f64,
+    ) -> (f64, f64, f64, f64) {
+        let n_sum: f64 = products.iter().map(|(moles, _)| *moles).sum();
+        let products: Vec<(f64, Species, &TemperatureDependentProperty, f64)> = products
+            .iter()
+            .map(|(moles, species)| {
+                (
+                    *moles, // number of moles, n
+                    *species,
+                    tr.get_tdp(&species.symbol()),
+                    moles / n_sum, // mole fraction, x
+                )
+            })
+            .collect();
+        let h_total: f64 = products
+            .iter()
+            .map(|(n_i, _, tdp_i, _)| n_i * tdp_i.h(temperature_k))
+            .sum();
+        let s_total: f64 = products
+            .iter()
+            .map(|(n_i, _, tdp_i, x_i)| {
+                n_i * (tdp_i.s(temperature_k)
+                    - R * (x_i * pressure_bar / STD_REFERENCE_PRESSURE).ln())
+            })
+            .sum();
+        let avg_mw: f64 = products
+            .iter()
+            .map(|(_, species_i, _, x_i)| x_i * species_i.mw())
+            .sum();
+        let avg_cp: f64 = products
+            .iter()
+            .map(|(_, _, tdp_i, x_i)| x_i * tdp_i.cp(temperature_k))
+            .sum();
+
+        (h_total, s_total, avg_mw, avg_cp)
+    }
+
+    pub fn print_products(&self) {
+        for (mole, species) in self.products.iter() {
+            println!("{:.2} {}", mole, species.symbol());
+        }
+    }
+
+    // Should balance enthalpies? So each mixture can be at a different temperature, but must be isobaric
+    // then do a bissection
+    pub fn mix(&self, other: &Self) -> Self {
+        todo!()
+        // let mut reatants_mix: HashMap<String, (f64, Species)> = HashMap::new();
+        // // Add all of original reatants to mix.
+        // for s in self.reactants.iter() {
+        //     let key = s.1.symbol();
+        //     reatants_mix.insert(key, s.clone());
+        // }
+        // for o in other.reactants.iter() {
+        //     let key = o.1.symbol();
+        //     if let Some(entry) = reatants_mix.get_mut(&key) {
+        //         // reatants already exists! Increment moles.
+        //         entry.0 += o.0;
+        //     } else {
+        //         // reatants is new, add them.
+        //         reatants_mix.insert(key, o.clone());
+        //     }
+        // }
+        // let mut reactants = reatants_mix
+        //     .drain()
+        //     .map(|(_, v)| v)
+        //     .collect::<Vec<(f64, Species)>>();
+        // reactants.sort_by(|a, b| a.1.symbol().cmp(&b.1.symbol()));
+        // Self { reactants }
+    }
+
+    pub fn scale(&self, tr: &ThermoReference, factor: f64) -> Self {
+        let scaled_products = self
+            .products
+            .iter()
+            .map(|(moles, species)| (*moles * factor, *species))
+            .collect();
+        Self::new_with_frozen_reactants(tr, scaled_products, self.temperature_k, self.pressure_bar)
+    }
+
+    fn reaction_pool(products: &Vec<(f64, Species)>) -> (Vec<Species>, Vec<(f64, Species)>) {
+        let mut element_pool: HashMap<Species, f64> = HashMap::new();
+        products.iter().for_each(|(parent_moles, parent_species)| {
+            let children = parent_species.constituents();
+            children.iter().for_each(|(child_moles, child_species)| {
+                if let Some(existing) = element_pool.get_mut(child_species) {
+                    *existing += parent_moles * child_moles;
+                } else {
+                    element_pool.insert(*child_species, parent_moles * child_moles);
+                }
+            });
+        });
+        // Filter out any species we don't have constituent elements for.
+        let species_pool = Species::all()
+            .iter()
+            .filter(|species| {
+                let children = species.constituents();
+                for child in children {
+                    if !element_pool.contains_key(&child.1) {
+                        return false;
+                    }
+                }
+                return true;
+            })
+            .map(|s| *s)
+            .collect::<Vec<Species>>();
+        let element_pool = element_pool
+            .drain()
+            .map(|(species, moles)| (moles, species))
+            .collect::<Vec<(f64, Species)>>();
+        (species_pool, element_pool)
+    }
+
+    pub fn solve_for_products(
+        tr: &ThermoReference,
+        temperature_k: f64,
+        pressure_bar: f64,
+        pi: &Vec<f64>,
+        ln_n: f64,
+        species_pool: &Vec<Species>,
+        a: &Vec<Vec<f64>>,
+        b: &Vec<f64>,
+    ) -> Option<(Vec<(f64, Species)>, Vec<f64>, f64)> {
+        let mut pi = pi.clone();
+        let mut ln_n = ln_n;
+        // Precompute mu_not.
+        let mu_not = species_pool
+            .iter()
+            .map(|species| {
+                let tdp = tr.get_tdp(&species.symbol());
+                let mu_not_i = tdp.h(temperature_k) - temperature_k * tdp.s(temperature_k);
+                mu_not_i
+            })
+            .collect::<Vec<f64>>();
+
         // n_i = n * c_i * exp(Σⱼ πⱼ·a[i][j])
         // i is in range form 0..species_pool.length
         // j is in range form 0..element_pool.length
@@ -153,21 +429,6 @@ impl Mixture {
                 * (sum - mu_not[i] / (R * temperature_k)).exp()
         };
         let j_len = a[0].len();
-        // b_j is element_pool[j].0
-        let b = element_pool
-            .iter()
-            .map(|(moles, _)| *moles)
-            .collect::<Vec<f64>>();
-
-        let (mut pi, mut ln_n) = self.guess_pi_and_ln_n(
-            temperature_k,
-            pressure_bar,
-            j_len,
-            &a,
-            &b,
-            &mu_not,
-            &species_pool,
-        );
 
         let mut iterations = 0;
         let mut final_n_vec = vec![];
@@ -180,30 +441,8 @@ impl Mixture {
                 break;
             }
 
-            if iterations <= 30 || iterations >= 55 {
-                println!("[{}] f norm: {}, lambda: {}", iterations, f.norm(), lambda);
-                let species_name = species_pool
-                    .iter()
-                    .map(|species| species.symbol())
-                    .zip(n_vec.iter())
-                    .map(|(species, moles)| (*moles, species))
-                    .collect::<Vec<(f64, String)>>();
-                println!("[{}] n: {:?}", iterations, species_name);
-                println!("[{}] pi: {:?}, ln_n: {}", iterations, pi, ln_n);
-            }
-
             if iterations == 4999 {
-                println!("[5000] f: {}", f);
-                println!("[5000] n: {:?}", n_vec);
-                let species_name = species_pool
-                    .iter()
-                    .map(|species| species.symbol())
-                    .zip(n_vec.iter())
-                    .map(|(species, moles)| (*moles, species))
-                    .collect::<Vec<(f64, String)>>();
-                println!("[5000] species: {:?}", species_name);
-
-                panic!("Failed to find solution to mixture!");
+                return None;
             }
 
             let current_norm = f.norm();
@@ -252,10 +491,7 @@ impl Mixture {
                 }
             }
             if !accepted {
-                panic!(
-                    "Line search failed to find a reducing step at iteration {}",
-                    iterations
-                );
+                return None;
             }
 
             iterations += 1;
@@ -267,26 +503,20 @@ impl Mixture {
             .map(|(&moles, &species)| (moles, species))
             .collect::<Vec<(f64, Species)>>();
 
-        Mixture::new(products)
+        Some((products, pi, ln_n))
     }
 
     fn guess_pi_and_ln_n(
-        &self,
+        products: &Vec<(f64, Species)>,
         temperature_k: f64,
         pressure_bar: f64,
         j_len: usize,
         a: &Vec<Vec<f64>>,
-        b: &Vec<f64>,
         mu_not: &Vec<f64>,
         species_pool: &Vec<Species>,
     ) -> (Vec<f64>, f64) {
         // Base ln_n_guess off of starting moles of the system.
-        let ln_n_guess = self
-            .reactants
-            .iter()
-            .map(|(moles, _)| *moles)
-            .sum::<f64>()
-            .ln();
+        let ln_n_guess = products.iter().map(|(moles, _)| *moles).sum::<f64>().ln();
 
         // Identify anchor species.
         let anchors: Vec<(usize, f64)> = species_pool
@@ -294,7 +524,7 @@ impl Mixture {
             .enumerate() // TODO convert to filter_map?
             .map(|(i, species)| {
                 let mut anchors_i = None;
-                for (moles, reactant) in self.reactants.iter() {
+                for (moles, reactant) in products.iter() {
                     if reactant == species {
                         anchors_i = Some((i, *moles));
                     }
@@ -343,105 +573,11 @@ impl Mixture {
         (pi_guess, ln_n_guess)
     }
 
-    pub fn h_total(&self, n: &Vec<f64>, temperature_k: f64, tr: &ThermoReference) -> f64 {
-        let mut h_total = 0.0;
-        let mut i = 0;
-        for specie in self.reactants.iter() {
-            h_total += n[i] * tr.get_tdp(&specie.1.symbol()).h(temperature_k);
-            i += 1;
-        }
-
-        h_total
-    }
-
-    pub fn x(&self, n: &Vec<f64>) -> Vec<f64> {
-        let n_sum: f64 = n.iter().sum();
-        n.iter().map(|n_i| n_i / n_sum).collect()
-    }
-
-    pub fn s_total(
-        &self,
-        x: &Vec<f64>,
-        n: &Vec<f64>,
-        temperature_k: f64,
-        pressure_bar: f64,
-        tr: &ThermoReference,
-    ) -> f64 {
-        let mut s_total = 0.0;
-        let mut i = 0;
-        for specie in self.reactants.iter() {
-            s_total += n[i]
-                * (tr.get_tdp(&specie.1.symbol()).s(temperature_k)
-                    - R * (x[i] * pressure_bar / STD_REFERENCE_PRESSURE).ln());
-            i += 1;
-        }
-
-        s_total
-    }
-
-    pub fn avg_mw(&self, x: &Vec<f64>) -> f64 {
-        let mut mw_total = 0.0;
-        let mut i = 0;
-        for specie in self.reactants.iter() {
-            mw_total += x[i] * specie.1.mw();
-            i += 1;
-        }
-
-        mw_total
-    }
-
-    pub fn avg_cp(&self, x: &Vec<f64>, temperature_k: f64, tr: &ThermoReference) -> f64 {
-        let mut cp_total = 0.0;
-        let mut i = 0;
-        for specie in self.reactants.iter() {
-            cp_total += x[i] * tr.get_tdp(&specie.1.symbol()).cp(temperature_k);
-            i += 1;
-        }
-
-        cp_total
-    }
-
     pub fn feed_mass(&self) -> f64 {
-        self.reactants
+        self.products
             .iter()
-            .map(|specie| specie.0 * specie.1.mw())
+            .map(|(moles, specie)| moles * specie.mw())
             .sum()
-    }
-
-    pub fn state(
-        &self,
-        temperature_k: f64,
-        pressure_bar: f64,
-        tr: &ThermoReference,
-    ) -> MixtureState {
-        // TODO state always tries to solve this, but for low temps its not needed.
-        let products = if temperature_k <= 0.0 {
-            self.clone()
-        } else {
-            self.solve_for_products(temperature_k, pressure_bar, tr)
-        };
-
-        let n = products
-            .reactants
-            .iter()
-            .map(|(moles, _)| *moles)
-            .collect::<Vec<f64>>();
-        let h_total = products.h_total(&n, temperature_k, tr);
-        let x = products.x(&n);
-        let s_total = products.s_total(&x, &n, temperature_k, pressure_bar, tr);
-
-        let n_total = n.iter().sum();
-        let avg_mw: f64 = products.avg_mw(&x);
-        let avg_cp: f64 = products.avg_cp(&x, temperature_k, tr);
-
-        MixtureState {
-            products,
-            h_total,
-            s_total,
-            n_total,
-            avg_mw,
-            avg_cp,
-        }
     }
 }
 
