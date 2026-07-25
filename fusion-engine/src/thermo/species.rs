@@ -23,6 +23,7 @@ pub struct Mixture {
     pub pressure_bar: f64,
     pub h_total: f64, // Total enthalpy.
     pub s_total: f64, // Total entropy.
+    pub n_total: f64,
     pub avg_mw: f64,
     pub avg_cp: f64,
 }
@@ -192,7 +193,7 @@ impl Mixture {
         };
         // every 1_000 K until we find a solution. This is our anchor
         // Move the anchor closer to temperature_k until we get it backing off half the distance on fail.
-        let (h_total, s_total, avg_mw, avg_cp) =
+        let (h_total, s_total, n_total, avg_mw, avg_cp) =
             Self::state(tr, &products, temperature_k, pressure_bar);
 
         Self {
@@ -201,6 +202,7 @@ impl Mixture {
             pressure_bar,
             h_total,
             s_total,
+            n_total,
             avg_mw,
             avg_cp,
         }
@@ -256,13 +258,13 @@ impl Mixture {
     // Assumes reactants == products
     pub fn new_with_frozen_reactants(
         tr: &ThermoReference,
-        reactants: Vec<(f64, Species)>,
+        reactants: &Vec<(f64, Species)>,
         temperature_k: f64,
         pressure_bar: f64,
     ) -> Self {
-        let products = reactants;
+        let products = reactants.clone();
 
-        let (h_total, s_total, avg_mw, avg_cp) =
+        let (h_total, s_total, n_total, avg_mw, avg_cp) =
             Self::state(tr, &products, temperature_k, pressure_bar);
 
         Self {
@@ -271,6 +273,7 @@ impl Mixture {
             pressure_bar,
             h_total,
             s_total,
+            n_total,
             avg_mw,
             avg_cp,
         }
@@ -281,8 +284,8 @@ impl Mixture {
         products: &Vec<(f64, Species)>,
         temperature_k: f64,
         pressure_bar: f64,
-    ) -> (f64, f64, f64, f64) {
-        let n_sum: f64 = products.iter().map(|(moles, _)| *moles).sum();
+    ) -> (f64, f64, f64, f64, f64) {
+        let n_total: f64 = products.iter().map(|(moles, _)| *moles).sum();
         let products: Vec<(f64, Species, &TemperatureDependentProperty, f64)> = products
             .iter()
             .map(|(moles, species)| {
@@ -290,7 +293,7 @@ impl Mixture {
                     *moles, // number of moles, n
                     *species,
                     tr.get_tdp(&species.symbol()),
-                    moles / n_sum, // mole fraction, x
+                    moles / n_total, // mole fraction, x
                 )
             })
             .collect();
@@ -314,17 +317,79 @@ impl Mixture {
             .map(|(_, _, tdp_i, x_i)| x_i * tdp_i.cp(temperature_k))
             .sum();
 
-        (h_total, s_total, avg_mw, avg_cp)
+        (h_total, s_total, n_total, avg_mw, avg_cp)
     }
 
     pub fn print_products(&self) {
         println!("Products Temperature: {:.3} K", self.temperature_k);
         for (mole, species) in self.products.iter() {
-            if *mole < 1.0e-2 {
+            if *mole < 1.0e-6 {
                 continue;
             }
-            println!("{:.2} {}", mole, species.symbol());
+            println!("{:.6} {}", mole, species.symbol());
         }
+    }
+
+    pub fn solve_for_target_enthalpy(&self, tr: &ThermoReference, target_enthalpy: f64) -> Mixture {
+        // Find a bracket where f(T) = h(T) - starting_h changes sign
+        let step = 500.0;
+        // Walk down from the hot temperature.
+        let mut t_low = self.temperature_k;
+        let mut low_scratch = Mixture::new(tr, &self.products, t_low, self.pressure_bar);
+        let mut f_low = low_scratch.h_total - target_enthalpy;
+        while f_low > 0.0 && t_low > 200.0 {
+            let next_t = (t_low - step).max(200.0);
+            low_scratch = Mixture::new(tr, &low_scratch.products, next_t, self.pressure_bar);
+            t_low = next_t;
+            f_low = low_scratch.h_total - target_enthalpy;
+        }
+        // Walk up from the hot temperature.
+        let mut t_high = self.temperature_k;
+        let mut high_scratch = Mixture::new(tr, &self.products, t_high, self.pressure_bar);
+        let mut f_high = high_scratch.h_total - target_enthalpy;
+        while f_high < 0.0 && t_high < 20_000.0 {
+            let next_t = (t_high + step).min(20_000.0);
+            high_scratch = Mixture::new(tr, &high_scratch.products, next_t, self.pressure_bar);
+            t_high = next_t;
+            f_high = high_scratch.h_total - target_enthalpy;
+        }
+
+        if f_low > 0.0 || f_high < 0.0 {
+            println!("Temperature Range: {:.3} <-> {:.3}", t_low, t_high);
+            panic!("Could not bracket adiabatic mix temperature");
+        }
+
+        // Now determine actual new mix
+        let mut t = t_low + (t_high - t_low) / 2.0;
+        let mut iterations = 0;
+        let mut final_products = None;
+        while iterations < 100 {
+            if (t_high - t_low).abs() < 1.0e-6 {
+                final_products = Some(low_scratch);
+                break;
+            }
+            let seed = if (t - t_low).abs() <= (t_high - t).abs() {
+                &low_scratch.products
+            } else {
+                &high_scratch.products
+            };
+            let mid_scratch = Mixture::new(tr, seed, t, self.pressure_bar);
+            let f_mid = mid_scratch.h_total - target_enthalpy;
+
+            if f_mid < 0.0 {
+                // Raise temperature
+                t_low = t;
+                low_scratch = mid_scratch;
+            } else {
+                // Lower temperature
+                t_high = t;
+                high_scratch = mid_scratch;
+            }
+            t = t_low + (t_high - t_low) / 2.0;
+            iterations += 1;
+        }
+
+        final_products.expect("Failed to mix products")
     }
 
     pub fn mix(&self, tr: &ThermoReference, other: &Self) -> Self {
@@ -373,64 +438,8 @@ impl Mixture {
             .collect::<Vec<(f64, Species)>>();
         reactants.sort_by(|a, b| a.1.symbol().cmp(&b.1.symbol()));
 
-        // Find a bracket where f(T) = h(T) - starting_h changes sign
-        let step = 500.0;
-        // Walk down from the hot temperature.
-        let mut t_low = hot.temperature_k;
-        let mut low_scratch = Mixture::new(tr, &reactants, t_low, pressure_bar);
-        let mut f_low = low_scratch.h_total - starting_h;
-        while f_low > 0.0 && t_low > 200.0 {
-            let next_t = (t_low - step).max(200.0);
-            low_scratch = Mixture::new(tr, &low_scratch.products, next_t, pressure_bar);
-            t_low = next_t;
-            f_low = low_scratch.h_total - starting_h;
-        }
-        // Walk up from the hot temperature.
-        let mut t_high = hot.temperature_k;
-        let mut high_scratch = Mixture::new(tr, &reactants, t_high, pressure_bar);
-        let mut f_high = high_scratch.h_total - starting_h;
-        while f_high < 0.0 && t_high < 20_000.0 {
-            let next_t = (t_high + step).min(20_000.0);
-            high_scratch = Mixture::new(tr, &high_scratch.products, next_t, pressure_bar);
-            t_high = next_t;
-            f_high = high_scratch.h_total - starting_h;
-        }
-
-        if f_low > 0.0 || f_high < 0.0 {
-            panic!("Could not bracket adiabatic mix temperature");
-        }
-
-        // Now determine actual new mix
-        let mut t = t_low + (t_high - t_low) / 2.0;
-        let mut iterations = 0;
-        let mut mixed_products = None;
-        while iterations < 100 {
-            if (t_high - t_low).abs() < 1.0e-6 {
-                mixed_products = Some(low_scratch);
-                break;
-            }
-            let seed = if (t - t_low).abs() <= (t_high - t).abs() {
-                &low_scratch.products
-            } else {
-                &high_scratch.products
-            };
-            let mid_scratch = Mixture::new(tr, seed, t, pressure_bar);
-            let f_mid = mid_scratch.h_total - starting_h;
-
-            if f_mid < 0.0 {
-                // Raise temperature
-                t_low = t;
-                low_scratch = mid_scratch;
-            } else {
-                // Lower temperature
-                t_high = t;
-                high_scratch = mid_scratch;
-            }
-            t = t_low + (t_high - t_low) / 2.0;
-            iterations += 1;
-        }
-
-        mixed_products.expect("Failed to mix products")
+        let combined = Mixture::new(tr, &reactants, hot.temperature_k, pressure_bar);
+        combined.solve_for_target_enthalpy(tr, starting_h)
     }
 
     pub fn scale(&self, tr: &ThermoReference, factor: f64) -> Self {
@@ -439,7 +448,7 @@ impl Mixture {
             .iter()
             .map(|(moles, species)| (*moles * factor, *species))
             .collect();
-        Self::new_with_frozen_reactants(tr, scaled_products, self.temperature_k, self.pressure_bar)
+        Self::new_with_frozen_reactants(tr, &scaled_products, self.temperature_k, self.pressure_bar)
     }
 
     fn reaction_pool(products: &Vec<(f64, Species)>) -> (Vec<Species>, Vec<(f64, Species)>) {
