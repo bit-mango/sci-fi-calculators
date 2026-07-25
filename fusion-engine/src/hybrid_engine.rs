@@ -400,7 +400,7 @@ fn calculate_engine_output(
     results
 }
 
-// TODO thermo reference for water at higher temperatures?
+// TODO RENAME OOGA BOOGA VARIABLES IN THIS like all the state stuff.
 // TODO add some effiency number?
 // Where the engine power is not accounting for
 // losses at all

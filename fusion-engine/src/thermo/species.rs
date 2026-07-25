@@ -5,7 +5,9 @@ use crate::thermo::reactions::{get_rxn_enthalpy, get_rxn_entropy};
 use crate::thermo::species;
 use nalgebra::{DMatrix, DVector, dmatrix, dvector};
 use std::collections::HashMap;
+use std::f64;
 
+// TODO rename file to mixture.rs and move species out of it into its own file.
 #[derive(Default)]
 pub struct MixtureState {
     pub products: Mixture,
@@ -104,8 +106,9 @@ impl Mixture {
             ap.0
         } else {
             // Couldn't find anchor products so now recursively iterate to find the anchor, the walk it toward temperature_k
-            let mut t_low = (temperature_k - (temperature_k % 1_000.0)).max(200.0);
-            let mut t_high = t_low + 1_000.0;
+            let step = 100.0;
+            let mut t_low = (temperature_k - (temperature_k % step)).max(200.0);
+            let mut t_high = t_low + step;
             let mut anchor = None;
             let mut anchor_temperature_k = 0.0;
 
@@ -143,17 +146,17 @@ impl Mixture {
                         break;
                     } else {
                         // Neither worked, adjust t_low, and t_high.
-                        t_low = (t_low - 1_000.0).max(200.0);
-                        t_high = (t_high + 1_000.0).min(20_000.0);
+                        t_low = (t_low - step).max(200.0);
+                        t_high = (t_high + step).min(20_000.0);
                     }
                 }
             }
             let mut products = None;
+            let mut anchor_iterations = 0;
             if let Some(anc) = anchor {
                 // Now walk the anchor some max iterations.
                 let mut anc = anc;
-                let mut anchor_iterations = 0;
-                while anchor_iterations < 20 {
+                while anchor_iterations < 60 {
                     let next_anchor = Self::walk_anchor(
                         tr,
                         anchor_temperature_k,
@@ -187,9 +190,16 @@ impl Mixture {
                     anchor_iterations += 1;
                 }
             } else {
+                println!(
+                    "Failed to find anchor. t_low={:.3} t_high={:.3}\nreactants={:?}",
+                    t_low, t_high, reactants
+                );
                 panic!("Unable to find anchor point!");
             }
-            products.unwrap()
+            products.expect(&format!(
+                "Anchor walk did not converge to {:.3} K within {} iterations (last anchor at {:.3} K)",
+                temperature_k, anchor_iterations, anchor_temperature_k
+            ))
         };
         // every 1_000 K until we find a solution. This is our anchor
         // Move the anchor closer to temperature_k until we get it backing off half the distance on fail.
@@ -219,40 +229,43 @@ impl Mixture {
         temperature_k: f64,
         pressure_bar: f64,
     ) -> Option<(Vec<(f64, Species)>, Vec<f64>, f64, f64)> {
-        // Try solving temperature_k.
-        let result = if let Some(result) = Self::solve_for_products(
-            tr,
-            temperature_k,
-            pressure_bar,
-            anchor_pi,
-            anchor_ln_n,
-            &species_pool,
-            &a,
-            &b,
-        ) {
-            Some((result.0, result.1, result.2, temperature_k))
+        let direction = if temperature_k > anchor_temperature_k {
+            1.0
         } else {
-            if (anchor_temperature_k - temperature_k).abs() < 1.0e-3 {
-                None
-            } else {
-                let midpoint = (anchor_temperature_k - temperature_k).abs() / 2.0
-                    + anchor_temperature_k.min(temperature_k);
-
-                Self::walk_anchor(
-                    tr,
-                    anchor_temperature_k,
-                    anchor_pi,
-                    anchor_ln_n,
-                    species_pool,
-                    a,
-                    b,
-                    midpoint,
-                    pressure_bar,
-                )
-            }
+            -1.0
         };
+        let mut t = anchor_temperature_k;
+        let mut pi = anchor_pi.clone();
+        let mut ln_n = anchor_ln_n;
+        let mut step = 1_000.0;
 
-        result
+        while (temperature_k - t).abs() > 1.0e-6 {
+            let remaining = temperature_k - t;
+            let next_t = if remaining.abs() <= step {
+                temperature_k
+            } else {
+                t + direction * step
+            };
+            match Self::solve_for_products(tr, next_t, pressure_bar, &pi, ln_n, species_pool, a, b)
+            {
+                Some((products, next_pi, next_ln_n)) => {
+                    t = next_t;
+                    pi = next_pi;
+                    ln_n = next_ln_n;
+                    if t == temperature_k {
+                        return Some((products, pi, ln_n, t));
+                    }
+                }
+                None => {
+                    step /= 2.0;
+                    if step < 1.0e-3 {
+                        // Truly stuck
+                        return None; // let the outer loops could not converge panic report where we got stuck
+                    }
+                }
+            }
+        }
+        None
     }
 
     // Assumes reactants == products
@@ -463,6 +476,8 @@ impl Mixture {
                 }
             });
         });
+        // Add electrons to the element pool.
+        element_pool.entry(Species::E).or_insert(0.0);
         // Filter out any species we don't have constituent elements for.
         let species_pool = Species::all()
             .iter()
@@ -477,10 +492,11 @@ impl Mixture {
             })
             .map(|s| *s)
             .collect::<Vec<Species>>();
-        let element_pool = element_pool
+        let mut element_pool = element_pool
             .drain()
             .map(|(species, moles)| (moles, species))
             .collect::<Vec<(f64, Species)>>();
+        element_pool.sort_by(|a, b| a.1.symbol().cmp(&b.1.symbol()));
         (species_pool, element_pool)
     }
 
@@ -617,6 +633,9 @@ impl Mixture {
             .iter()
             .enumerate() // TODO convert to filter_map?
             .map(|(i, species)| {
+                if species.is_charged() {
+                    return None;
+                }
                 let mut anchors_i = None;
                 for (moles, reactant) in products.iter() {
                     if reactant == species && *moles / total_moles > threshold {
@@ -625,8 +644,7 @@ impl Mixture {
                 }
                 anchors_i
             })
-            .filter(|anchors_i| anchors_i.is_some())
-            .map(|anchors_i| anchors_i.unwrap())
+            .filter_map(|anchors_i| anchors_i)
             .collect();
 
         // Build A (anchors.len() × j_len) and rhs (anchors.len()) from the anchor list:
@@ -744,6 +762,11 @@ pub enum Species {
     O2,
     CH4,
     NH3,
+    E,
+    HPlus,
+    CPlus,
+    OPlus,
+    NPlus,
 }
 
 impl Species {
@@ -762,6 +785,11 @@ impl Species {
             Self::O2,
             Self::CH4,
             Self::NH3,
+            Self::E,
+            Self::HPlus,
+            Self::CPlus,
+            Self::OPlus,
+            Self::NPlus,
         ]
     }
     pub fn symbol(&self) -> String {
@@ -779,6 +807,11 @@ impl Species {
             Species::OH => "OH".to_string(),
             Species::CH4 => "CH4".to_string(),
             Species::NH3 => "NH3".to_string(),
+            Species::E => "e-".to_string(),
+            Species::HPlus => "H+".to_string(),
+            Species::CPlus => "C+".to_string(),
+            Species::OPlus => "O+".to_string(),
+            Species::NPlus => "N+".to_string(),
         }
     }
 
@@ -797,6 +830,11 @@ impl Species {
             Species::OH => OH_MW,
             Species::CH4 => CH4_MW,
             Species::NH3 => NH3_MW,
+            Species::E => 0.0,
+            Species::HPlus => H_MW,
+            Species::CPlus => C_MW,
+            Species::OPlus => O_MW,
+            Species::NPlus => N_MW,
         }
     }
 
@@ -815,6 +853,17 @@ impl Species {
             Species::OH => vec![(1.0, Species::O), (1.0, Species::H)],
             Species::CH4 => vec![(1.0, Species::C), (4.0, Species::H)],
             Species::NH3 => vec![(1.0, Species::N), (3.0, Species::H)],
+            Species::E => vec![(1.0, Species::E)],
+            Species::HPlus => vec![(1.0, Species::H), (-1.0, Species::E)],
+            Species::CPlus => vec![(1.0, Species::C), (-1.0, Species::E)],
+            Species::OPlus => vec![(1.0, Species::O), (-1.0, Species::E)],
+            Species::NPlus => vec![(1.0, Species::N), (-1.0, Species::E)],
         }
+    }
+    pub fn is_charged(&self) -> bool {
+        matches!(
+            self,
+            Species::E | Species::HPlus | Species::CPlus | Species::OPlus | Species::NPlus
+        )
     }
 }
