@@ -3,7 +3,7 @@ use crate::nozzle::area_ratio::exit_pressure_from_area_ratio;
 use crate::thermo::fluid_properties::ThermoReference;
 use std::f64::consts::PI;
 
-use crate::thermo::species::{Mixture, MixtureState, Species};
+use crate::thermo::{mixture::Mixture, species::Species};
 
 fn required_max_channel_area(
     n_dot_reaction: f64,
@@ -407,7 +407,7 @@ fn calculate_engine_output(
 // Waste heat needs to account for this loss, and loss from fusion to electricity, and
 // the heat from disassociation and water electrolysis
 pub fn sweep_engine() {
-    let voltage = 400.0;
+    let voltage = 1_000.0; // Increase this for higher temps
     let engine_power = 50.0e6;
     let t_propellant_start = 300.0;
     let t_diluent_start = 1_000.0;
@@ -416,24 +416,26 @@ pub fn sweep_engine() {
     let aperture_diameter = 0.5e-3;
     let funnel_length = 7.0; // meters
     let t_allowed_max_chamber = 20_000.0; // When using water diluent
-    let chamber_pressure = 25.0;
+    let chamber_pressure = 50.0;
     let tr = ThermoReference::new();
 
     let propellant = Mixture::new(
         &tr,
         &vec![(1.0, Species::CO), (2.0, Species::H2)],
         t_propellant_start,
-        25.0,
+        chamber_pressure,
     );
     let diluent = Mixture::new(
         &tr,
-        &vec![(1.0, Species::H2), (5.0, Species::H2O)],
+        &vec![(1.0, Species::H2), (10.0, Species::H2O)],
         t_diluent_start,
-        25.0,
+        chamber_pressure,
     );
 
-    let collision_theta_deg = 5.0;
-    let coupling_efficiency = 0.03; // Higher because chamber has 6 moles of diluent plus disassociation
+    // TODO seems like raising chamber pressure, increases temperature, which lets
+    // me lower theta, which converses more axial velocity!
+    let collision_theta_deg = 10.5;
+    let coupling_efficiency = 0.05; // Higher because chamber has 6 moles of diluent plus disassociation
     let fixed_total_throat_area = None; // Derive area
     println!("===== Thrust Mode =====");
     calculate_engine_output(
@@ -455,9 +457,14 @@ pub fn sweep_engine() {
         fixed_total_throat_area,
     );
 
-    let diluent = Mixture::new(&tr, &vec![(1.0, Species::H2)], 1_000.0, 25.0);
+    let diluent = Mixture::new(
+        &tr,
+        &vec![(1.0, Species::H2), (1.0, Species::H2O)],
+        t_diluent_start,
+        chamber_pressure,
+    );
 
-    let collision_theta_deg = 3.0;
+    let collision_theta_deg = 10.5;
     let coupling_efficiency = 0.005; // Lower because chamber only has 1 mole H2
     println!("===== Isp Mode =====");
     calculate_engine_output(
