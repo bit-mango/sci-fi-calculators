@@ -10,6 +10,11 @@ pub const CH4_FIRST_IONIZATION: f64 = 1_216.0e3; // CH4 =? CH4+ + e-
 pub const H2O_ELECTROLYSIS: f64 = 285.8e3; // J/mol H2O => H2 + 1/2 O2
 pub const CH4_PARTIAL_OXIDATION_ENERGY: f64 = 284.7e3; // CH4 + O => CO + 2H2
 
+// H2O => OH- + H+ [1_633 kJ/mol]
+// CH4 + H+ => CH5+ [-544 kJ/mol]
+// Overall: CH4 + H2O => CH5+ + OH- [1_633 - 544 = 1_089]
+pub const CH4_H2O_PROTON_TRANSFER: f64 = 1_089.0e3;
+
 pub const H_MW: f64 = 1.0e-3;
 pub const H2_MW: f64 = 2.0 * H_MW;
 pub const C_MW: f64 = 12.0e-3;

@@ -32,6 +32,8 @@ use crate::nozzle::{
 };
 use crate::thermo::fluid_properties::ThermoReference;
 
+use crate::thermo::gibbs_min::*;
+
 fn main() {
     sweep_engine();
     // let target_area_ratio = 100.0;

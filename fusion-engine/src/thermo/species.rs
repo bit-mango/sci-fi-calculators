@@ -21,6 +21,7 @@ pub enum Species {
     CPlus,
     OPlus,
     NPlus,
+    OHNeg,
 }
 
 impl Species {
@@ -44,6 +45,7 @@ impl Species {
             Self::CPlus,
             Self::OPlus,
             Self::NPlus,
+            Self::OHNeg,
         ]
     }
     pub fn symbol(&self) -> String {
@@ -66,6 +68,7 @@ impl Species {
             Species::CPlus => "C+".to_string(),
             Species::OPlus => "O+".to_string(),
             Species::NPlus => "N+".to_string(),
+            Species::OHNeg => "OH-".to_string(),
         }
     }
 
@@ -89,6 +92,7 @@ impl Species {
             Species::CPlus => C_MW,
             Species::OPlus => O_MW,
             Species::NPlus => N_MW,
+            Species::OHNeg => OH_MW,
         }
     }
 
@@ -112,12 +116,18 @@ impl Species {
             Species::CPlus => vec![(1.0, Species::C), (-1.0, Species::E)],
             Species::OPlus => vec![(1.0, Species::O), (-1.0, Species::E)],
             Species::NPlus => vec![(1.0, Species::N), (-1.0, Species::E)],
+            Species::OHNeg => vec![(1.0, Species::O), (1.0, Species::H), (1.0, Species::E)],
         }
     }
     pub fn is_charged(&self) -> bool {
         matches!(
             self,
-            Species::E | Species::HPlus | Species::CPlus | Species::OPlus | Species::NPlus
+            Species::E
+                | Species::HPlus
+                | Species::CPlus
+                | Species::OPlus
+                | Species::NPlus
+                | Species::OHNeg
         )
     }
 }

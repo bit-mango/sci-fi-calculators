@@ -1,9 +1,10 @@
 use super::species::Species;
 use crate::constants::*;
 use crate::thermo::fluid_properties::{TemperatureDependentProperty, ThermoReference};
+use good_lp::{DualValues, Solution, SolutionWithDual, SolverModel, constraint, variables};
 use nalgebra::{DMatrix, DVector};
 use std::collections::HashMap;
-use std::f64;
+use std::{f64, iter};
 
 #[derive(Clone, Default)]
 pub struct Mixture {
@@ -603,10 +604,10 @@ impl Mixture {
                 .zip(a[i].iter())
                 .map(|(pi_i, a_i_j)| pi_i * a_i_j)
                 .sum::<f64>();
-            let raw_exponent = (sum - mu_not[i] / (R * temperature_k));
-            let clamped = raw_exponent > 60.0;
-            let exponent = raw_exponent.min(60.0); // TODO is this actually helping?
-            let value = ln_n.exp() * (STD_REFERENCE_PRESSURE / pressure_bar) * exponent.exp();
+            let raw_exponent = sum - mu_not[i] / (R * temperature_k);
+            let log_value = ln_n + (STD_REFERENCE_PRESSURE / pressure_bar).ln() + raw_exponent;
+            let clamped = log_value > 650.0;
+            let value = log_value.min(650.0).exp();
             (value, clamped)
         };
         let j_len = a[0].len();
@@ -650,13 +651,9 @@ impl Mixture {
                     // species' moles to ~0 and others to overflow in one shot,
                     // which then singularizes J on the next iteration. Cap the
                     // largest per-step change so no n_i can move by more than
-                    // ~e^2 in a single iteration.
+                    // ~e^3 in a single iteration.
                     let max_step = delta.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
-                    let alpha = if max_step > 25.0 {
-                        25.0 / max_step
-                    } else {
-                        1.0
-                    };
+                    let alpha = if max_step > 3.0 { 3.0 / max_step } else { 1.0 };
 
                     let trial_pi: Vec<f64> = (0..j_len).map(|k| pi[k] + alpha * delta[k]).collect();
                     let trial_ln_n = ln_n + alpha * delta[j_len];
@@ -700,16 +697,16 @@ impl Mixture {
         let ln_n_guess = products.iter().map(|(moles, _)| *moles).sum::<f64>().ln();
 
         let total_moles: f64 = products.iter().map(|(moles, _)| *moles).sum();
-        let threshold = 1.0e-9; // relative to total system moles.
+        let threshold = 1.0e-6; // relative to total system moles.
 
         // Identify anchor species.
         let anchors: Vec<(usize, f64)> = species_pool
             .iter()
             .enumerate() // TODO convert to filter_map?
             .map(|(i, species)| {
-                if species.is_charged() && *species != Species::E {
-                    return None;
-                }
+                // if species.is_charged() && *species != Species::E {
+                //     return None;
+                // }
                 let mut anchors_i = None;
                 for (moles, reactant) in products.iter() {
                     if reactant == species && *moles / total_moles > threshold {
@@ -752,20 +749,65 @@ impl Mixture {
         }
 
         let pi_guess: Vec<f64> = match ata_reg.lu().solve(&atb) {
-            Some(pi) => pi.iter().copied().collect(),
-            None => vec![0.0; j_len], // degenerate anchors (e.g. duplicate rows) - fall back
+            Some(pi) => {
+                let pi: Vec<f64> = pi.iter().copied().collect();
+                let sane = species_pool.iter().enumerate().all(|(i, _)| {
+                    let dot: f64 = pi.iter().zip(a[i].iter()).map(|(p, aij)| p * aij).sum();
+                    let raw_exponent = dot - mu_not[i] / (R * temperature_k);
+                    raw_exponent < 50.0
+                });
+                if sane { pi } else { vec![0.0; j_len] }
+            }
+            _ => vec![0.0; j_len],
         };
 
-        for (i, species) in species_pool.iter().enumerate() {
-            let sum: f64 = pi_guess
-                .iter()
-                .zip(a[i].iter())
-                .map(|(p, aij)| p * aij)
-                .sum();
-            let exponent = sum - mu_not[i] / (R * temperature_k);
+        (pi_guess, ln_n_guess)
+    }
+
+    fn lp_seed_products(
+        temperature_k: f64,
+        j_len: usize,
+        a: &Vec<Vec<f64>>,
+        b: &Vec<f64>,
+        mu_not: &Vec<f64>,
+        species_pool: &Vec<Species>,
+    ) -> Vec<(f64, Species)> {
+        let mut vars = variables!();
+        let x: Vec<_> = species_pool
+            .iter()
+            .map(|_| vars.add(good_lp::variable().min(0.0)))
+            .collect();
+
+        // Objective: minimize sum(c_i * x_i), c_i = mu_not[i] / RT
+        let objective: good_lp::Expression = x
+            .iter()
+            .enumerate()
+            .map(|(i, &xi)| (mu_not[i] / (R * temperature_k)) * xi)
+            .sum();
+
+        let mut model = vars.minimise(objective).using(good_lp::clarabel);
+
+        // One equality constraint per element: sum_i a[i][j] * x_i == b[j]
+        let mut constraint_refs = Vec::with_capacity(j_len);
+        for j in 0..j_len {
+            let lhs: good_lp::Expression = x.iter().enumerate().map(|(i, &xi)| a[i][j] * xi).sum();
+            constraint_refs.push(model.add_constraint(constraint!(lhs == b[j])));
         }
 
-        (pi_guess, ln_n_guess)
+        let solution = model.solve().expect("LP seed failed to solve");
+        let lp_moles: Vec<f64> = x.iter().map(|&xi| solution.value(xi)).collect();
+
+        let products: Vec<(f64, Species)> = lp_moles
+            .iter()
+            .zip(species_pool.iter())
+            .map(|(&moles, &species)| (moles, species))
+            .collect();
+
+        products.iter().for_each(|(moles, species)| {
+            println!("{:.2}•{}", moles, species.symbol());
+        });
+
+        products
     }
 
     pub fn feed_mass(&self) -> f64 {
@@ -797,12 +839,19 @@ fn residual_and_jacobian(
     for j in 0..j_len {
         let mut sum = 0.0;
         for i in 0..i_len {
-            sum += n_vec[i] * a[i][j];
+            if !clamped[i] {
+                sum += n_vec[i] * a[i][j];
+            }
         }
         sum -= b[j];
         f_vec[j] = sum;
     }
-    let n_sum = n_vec.iter().sum::<f64>();
+    let n_sum: f64 = n_vec
+        .iter()
+        .zip(clamped.iter())
+        .filter(|(_, c)| !**c)
+        .map(|(v, _)| v)
+        .sum();
     f_vec[j_len] = n_sum - ln_n.exp();
     let mut j_vec = vec![vec![0.0; j_len + 1]; j_len + 1];
     for j in 0..j_len {
@@ -820,7 +869,9 @@ fn residual_and_jacobian(
     for j in 0..j_len {
         let mut sum = 0.0;
         for i in 0..i_len {
-            sum += n_vec[i] * a[i][j];
+            if !clamped[i] {
+                sum += n_vec[i] * a[i][j];
+            }
         }
         j_vec[j][j_len] = sum;
         j_vec[j_len][j] = sum;
@@ -833,4 +884,88 @@ fn residual_and_jacobian(
     // but thats messy lets fix it.
     let j_matrix = DMatrix::from_vec(j_len + 1, j_len + 1, flattened_j);
     (n_vec, f_vec, j_matrix)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn solve_for_products_stability() {
+        let tr = &ThermoReference::new();
+        let temperature_k = 800.0;
+        let pressure_bar = 50.0;
+        // let products = &vec![(1.0, Species::H2O)];
+        // let products = &vec![(1.0, Species::CH4), (2.0, Species::O2)];
+        let products = &vec![
+            (1.0, Species::CH4),
+            (1.0, Species::HPlus),
+            (1.0, Species::OHNeg),
+        ];
+        let (species_pool, element_pool) = Mixture::reaction_pool(products);
+        // Precompute mu_not.
+        let mu_not = species_pool
+            .iter()
+            .map(|species| {
+                let tdp = tr.get_tdp(&species.symbol());
+                let mu_not_i = tdp.h(temperature_k) - temperature_k * tdp.s(temperature_k);
+                mu_not_i
+            })
+            .collect::<Vec<f64>>();
+
+        let a = species_pool
+            .iter()
+            .map(|species| {
+                let children = species.constituents();
+                element_pool
+                    .iter()
+                    .map(|(_, elem)| {
+                        children
+                            .iter()
+                            .find(|(_, child)| child == elem)
+                            .unwrap_or(&(0.0, *elem))
+                            .0
+                    })
+                    .collect::<Vec<f64>>()
+            })
+            .collect::<Vec<Vec<f64>>>();
+
+        let j_len = a[0].len();
+        // b_j is element_pool[j].0
+        let b = element_pool
+            .iter()
+            .map(|(moles, _)| *moles)
+            .collect::<Vec<f64>>();
+        let products =
+            &Mixture::lp_seed_products(temperature_k, j_len, &a, &b, &mu_not, &species_pool);
+        println!("lp_seed_products: {:?}", products);
+        let (pi_guess, ln_n_guess) = Mixture::guess_pi_and_ln_n(
+            products,
+            temperature_k,
+            pressure_bar,
+            j_len,
+            &a,
+            &mu_not,
+            &species_pool,
+        );
+        println!("reactant_pi_guess: {:?}", pi_guess);
+
+        let result = Mixture::solve_for_products(
+            tr,
+            temperature_k,
+            pressure_bar,
+            &pi_guess,
+            ln_n_guess,
+            &species_pool,
+            &a,
+            &b,
+        );
+
+        assert!(result.is_some(), "Failed to find result");
+
+        let (products, _, _) = result.unwrap();
+        products
+            .iter()
+            .for_each(|(moles, species)| println!("{:.2}•{}", moles, species.symbol()));
+    }
 }
