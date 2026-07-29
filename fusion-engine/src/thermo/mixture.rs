@@ -1,10 +1,9 @@
 use super::species::Species;
 use crate::constants::*;
 use crate::thermo::fluid_properties::{TemperatureDependentProperty, ThermoReference};
-use good_lp::{DualValues, Solution, SolutionWithDual, SolverModel, constraint, variables};
 use nalgebra::{DMatrix, DVector};
 use std::collections::HashMap;
-use std::{f64, iter};
+use std::f64;
 
 #[derive(Clone, Default)]
 pub struct Mixture {
@@ -19,15 +18,13 @@ pub struct Mixture {
 }
 
 impl Mixture {
-    // TODO add a new method that accepts some initial pi and ln_n guess for carry voer work?
     pub fn new(
         tr: &ThermoReference,
         reactants: &Vec<(f64, Species)>,
         temperature_k: f64,
         pressure_bar: f64,
     ) -> Self {
-        let (species_pool, element_pool) = Self::reaction_pool(&reactants);
-        // Precompute mu_not.
+        let (species_pool, element_pool) = Mixture::reaction_pool(reactants);
         let mu_not = species_pool
             .iter()
             .map(|species| {
@@ -36,163 +33,39 @@ impl Mixture {
                 mu_not_i
             })
             .collect::<Vec<f64>>();
-
-        // Each row is a species, and each column is how many moles of an element are in that species.
-        // Example:
-        //      H   O
-        // H2O  2   1
-        // OH   1   1
-        // H2   2   0
-        // H    1   0
-        // O2   0   2
-        // O    0   1
-        let a = species_pool
+        let a = element_pool
             .iter()
-            .map(|species| {
-                let children = species.constituents();
-                element_pool
+            .map(|(_, element)| {
+                species_pool
                     .iter()
-                    .map(|(_, elem)| {
+                    .map(|species| {
+                        let children = species.constituents();
                         children
                             .iter()
-                            .find(|(_, child)| child == elem)
-                            .unwrap_or(&(0.0, *elem))
+                            .find(|(_, child)| child == element)
+                            .unwrap_or(&(0.0, *element))
                             .0
                     })
                     .collect::<Vec<f64>>()
             })
             .collect::<Vec<Vec<f64>>>();
-
-        let j_len = a[0].len();
-        // b_j is element_pool[j].0
         let b = element_pool
             .iter()
             .map(|(moles, _)| *moles)
             .collect::<Vec<f64>>();
-        // Compute products given reactants and temperature_k.
-        let lp_reactants =
-            Mixture::lp_seed_products(temperature_k, j_len, &a, &b, &mu_not, &species_pool);
-        let products = if temperature_k < 1_000.0 {
-            // Just use the LP solution.
-            lp_reactants
-        } else {
-            // Compute guesses.
-            let (pi, ln_n) = Self::guess_pi_and_ln_n(
-                &lp_reactants,
-                temperature_k,
-                pressure_bar,
-                j_len,
-                &a,
-                &mu_not,
-                &species_pool,
-            );
-            // Find the anchor, try target temperature first, if that fails iterate up and down from it.
-            let products = if let Some(ap) = Self::solve_for_products_with_clean_up(
-                tr,
-                temperature_k,
-                pressure_bar,
-                &pi,
-                ln_n,
-                &species_pool,
-                &a,
-                &b,
-            ) {
-                ap.0
-            } else {
-                // Couldn't find anchor products so now recursively iterate to find the anchor, the walk it toward temperature_k
-                let step = 100.0;
-                let mut t_low = (temperature_k - (temperature_k % step)).max(200.0);
-                let mut t_high = t_low + step;
-                let mut anchor = None;
-                let mut anchor_temperature_k = 0.0;
-                let mut low_search_done = false;
-                let mut high_search_done = false;
 
-                while t_low > 200.0 || t_high < 20_000.0 {
-                    if !low_search_done {
-                        if t_low == 200.0 {
-                            low_search_done = true;
-                        }
-                        // Try t_low.
-                        let low_anchor = Self::solve_for_products_with_clean_up(
-                            tr,
-                            t_low,
-                            pressure_bar,
-                            &pi,
-                            ln_n,
-                            &species_pool,
-                            &a,
-                            &b,
-                        );
-                        if low_anchor.is_some() {
-                            anchor = low_anchor;
-                            anchor_temperature_k = t_low;
-                            break;
-                        }
-                    }
-                    if !high_search_done {
-                        if t_high == 20_000.0 {
-                            high_search_done = true;
-                        }
-                        // Try t_high.
-                        let high_anchor = Self::solve_for_products_with_clean_up(
-                            tr,
-                            t_high,
-                            pressure_bar,
-                            &pi,
-                            ln_n,
-                            &species_pool,
-                            &a,
-                            &b,
-                        );
-                        if high_anchor.is_some() {
-                            anchor = high_anchor;
-                            anchor_temperature_k = t_high;
-                            break;
-                        }
-                    }
-                    // Neither worked, adjust t_low, and t_high.
-                    t_low = (t_low - step).max(200.0);
-                    t_high = (t_high + step).min(20_000.0);
-                }
-                let products;
-                if let Some(anc) = anchor {
-                    let next_anchor = Self::walk_anchor(
-                        tr,
-                        anchor_temperature_k,
-                        &anc.1,
-                        anc.2,
-                        &species_pool,
-                        &a,
-                        &b,
-                        temperature_k,
-                        pressure_bar,
-                    );
-                    if let Some(next) = next_anchor {
-                        // We are done!
-                        products = Some(next.0);
-                    } else {
-                        panic!(
-                            "Could not converge to answer!
-                                Temperature wanted: {:.3} K
-                                Temperature walked to: {:.3} K",
-                            temperature_k, anchor_temperature_k
-                        )
-                    }
-                } else {
-                    println!(
-                        "Failed to find anchor for temperature: {:.3}. t_low={:.3} t_high={:.3}\nreactants={:?}",
-                        temperature_k, t_low, t_high, reactants
-                    );
-                    panic!("Unable to find anchor point!");
-                }
-                products.expect(&format!(
-                    "Anchor walk did not converge to {:.3} K (last anchor at {:.3} K)",
-                    temperature_k, anchor_temperature_k
-                ))
-            };
-            products
-        };
+        let result = Mixture::solve_for_products(
+            temperature_k,
+            pressure_bar,
+            &species_pool,
+            &element_pool,
+            &a,
+            &b,
+            &mu_not,
+        );
+
+        let products = result.expect("Failed to converge.");
+
         // every 1_000 K until we find a solution. This is our anchor
         // Move the anchor closer to temperature_k until we get it backing off half the distance on fail.
         let (h_total, s_total, n_total, avg_mw, avg_cp) =
@@ -208,64 +81,6 @@ impl Mixture {
             avg_mw,
             avg_cp,
         }
-    }
-
-    fn walk_anchor(
-        tr: &ThermoReference,
-        anchor_temperature_k: f64,
-        anchor_pi: &Vec<f64>,
-        anchor_ln_n: f64,
-        species_pool: &Vec<Species>,
-        a: &Vec<Vec<f64>>,
-        b: &Vec<f64>,
-        temperature_k: f64,
-        pressure_bar: f64,
-    ) -> Option<(Vec<(f64, Species)>, Vec<f64>, f64, f64)> {
-        let direction = if temperature_k > anchor_temperature_k {
-            1.0
-        } else {
-            -1.0
-        };
-        let mut t = anchor_temperature_k;
-        let mut pi = anchor_pi.clone();
-        let mut ln_n = anchor_ln_n;
-        let mut step = 1_000.0;
-
-        while (temperature_k - t).abs() > 1.0e-6 {
-            let remaining = temperature_k - t;
-            let next_t = if remaining.abs() <= step {
-                temperature_k
-            } else {
-                t + direction * step
-            };
-            match Self::solve_for_products_with_clean_up(
-                tr,
-                next_t,
-                pressure_bar,
-                &pi,
-                ln_n,
-                species_pool,
-                a,
-                b,
-            ) {
-                Some((products, next_pi, next_ln_n)) => {
-                    t = next_t;
-                    pi = next_pi;
-                    ln_n = next_ln_n;
-                    if t == temperature_k {
-                        return Some((products, pi, ln_n, t));
-                    }
-                }
-                None => {
-                    step /= 2.0;
-                    if step < 1.0e-3 {
-                        // Truly stuck
-                        return None; // let the outer loops could not converge panic report where we got stuck
-                    }
-                }
-            }
-        }
-        None
     }
 
     // Assumes reactants == products
@@ -500,422 +315,116 @@ impl Mixture {
         (species_pool, element_pool)
     }
 
-    pub fn solve_for_products_with_clean_up(
-        tr: &ThermoReference,
+    fn solve_for_products(
         temperature_k: f64,
         pressure_bar: f64,
-        pi: &Vec<f64>,
-        ln_n: f64,
-        species_pool: &Vec<Species>,
-        a: &Vec<Vec<f64>>,
-        b: &Vec<f64>,
-    ) -> Option<(Vec<(f64, Species)>, Vec<f64>, f64)> {
-        // Initial solve can have multiple insinificant mole count products that cause
-        // downstream product solves to be uneccessarily messy.
-        let dirty_products = Self::solve_for_products(
-            tr,
-            temperature_k,
-            pressure_bar,
-            pi,
-            ln_n,
-            species_pool,
-            a,
-            b,
-        );
-
-        if let Some((dirty, dirty_pi, dirty_ln_n)) = dirty_products.clone() {
-            let (species_pool, element_pool) = Self::reaction_pool(&dirty);
-            // Reduce species pool to only major species.
-            let filter: f64 = dirty.iter().map(|(moles, _)| moles).sum::<f64>() * 1.0e-8;
-            let species_pool: Vec<Species> = species_pool
-                .iter()
-                .filter(|&species| {
-                    let mut keep = false;
-                    for dirty_species in dirty.iter() {
-                        if dirty_species.1 == *species && dirty_species.0 >= filter {
-                            keep = true;
-                            break;
-                        }
-                    }
-                    keep
-                })
-                .map(|&species| species)
-                .collect();
-
-            let a = species_pool
-                .iter()
-                .map(|species| {
-                    let children = species.constituents();
-                    element_pool
-                        .iter()
-                        .map(|(_, elem)| {
-                            children
-                                .iter()
-                                .find(|(_, child)| child == elem)
-                                .unwrap_or(&(0.0, *elem))
-                                .0
-                        })
-                        .collect::<Vec<f64>>()
-                })
-                .collect::<Vec<Vec<f64>>>();
-
-            let b = element_pool
-                .iter()
-                .map(|(moles, _)| *moles)
-                .collect::<Vec<f64>>();
-
-            let clean_products = Self::solve_for_products(
-                tr,
-                temperature_k,
-                pressure_bar,
-                &dirty_pi,
-                dirty_ln_n,
-                &species_pool,
-                &a,
-                &b,
-            );
-            clean_products.or(dirty_products)
-        } else {
-            // Just return original as we failed to solve it
-            dirty_products
-        }
-    }
-
-    pub fn solve_for_products(
-        tr: &ThermoReference,
-        temperature_k: f64,
-        pressure_bar: f64,
-        pi: &Vec<f64>,
-        ln_n: f64,
-        species_pool: &Vec<Species>,
-        a: &Vec<Vec<f64>>,
-        b: &Vec<f64>,
-    ) -> Option<(Vec<(f64, Species)>, Vec<f64>, f64)> {
-        Self::solve_for_products_impl(
-            tr,
-            temperature_k,
-            pressure_bar,
-            pi.clone(),
-            ln_n,
-            species_pool,
-            a,
-            b,
-            None,
-        )
-    }
-
-    /// Same solver as `solve_for_products`, but seeded from NASA CEA's own
-    /// default starting estimate (RP-1311 section 3.2) run start-to-finish
-    /// as a single continuous iteration, rather than a one-step bootstrap
-    /// handed to a fresh solve_for_products call — a one-shot bootstrap was
-    /// tried and tested much worse (7.5% vs 85.83% baseline), because CEA's
-    /// robustness comes from running its *entire* multi-iteration process
-    /// (with one continuous λ schedule) starting from uniform mole numbers,
-    /// not from one linearized correction step.
-    ///
-    /// Every candidate species starts at the same small mole number (ENN=0.1
-    /// total, split evenly), and pi starts at an arbitrary zero reference —
-    /// pi only becomes meaningful once the first iteration's Newton step is
-    /// computed directly from that raw uniform composition, exactly
-    /// mirroring how CEA derives pi as an output of its first solve rather
-    /// than assuming it as an input.
-    pub fn solve_for_products_uniform_start(
-        tr: &ThermoReference,
-        temperature_k: f64,
-        pressure_bar: f64,
-        species_pool: &Vec<Species>,
-        a: &Vec<Vec<f64>>,
-        b: &Vec<f64>,
-    ) -> Option<(Vec<(f64, Species)>, Vec<f64>, f64)> {
-        const ENN_GUESS: f64 = 0.1;
-        let ln_n_guess = ENN_GUESS.ln();
-        let uniform_n_vec = vec![ENN_GUESS / species_pool.len() as f64; species_pool.len()];
-        let j_len = a[0].len();
-        let pi0 = vec![0.0; j_len];
-        Self::solve_for_products_impl(
-            tr,
-            temperature_k,
-            pressure_bar,
-            pi0,
-            ln_n_guess,
-            species_pool,
-            a,
-            b,
-            Some(uniform_n_vec),
-        )
-    }
-
-    fn solve_for_products_impl(
-        tr: &ThermoReference,
-        temperature_k: f64,
-        pressure_bar: f64,
-        pi: Vec<f64>,
-        ln_n: f64,
-        species_pool: &Vec<Species>,
-        a: &Vec<Vec<f64>>,
-        b: &Vec<f64>,
-        initial_uniform_n_vec: Option<Vec<f64>>,
-    ) -> Option<(Vec<(f64, Species)>, Vec<f64>, f64)> {
-        let mut pi = pi;
-        let mut ln_n = ln_n;
-        // Precompute mu_not.
-        let mu_not = species_pool
-            .iter()
-            .map(|species| {
-                let tdp = tr.get_tdp(&species.symbol());
-                let mu_not_i = tdp.h(temperature_k) - temperature_k * tdp.s(temperature_k);
-                mu_not_i
-            })
-            .collect::<Vec<f64>>();
-
-        // n_i = n * c_i * exp(Σⱼ πⱼ·a[i][j])
-        // i is in range form 0..species_pool.length
-        // j is in range form 0..element_pool.length
-        let n = |i: usize, pi: &[f64], ln_n: f64| {
-            let sum = pi
-                .iter()
-                .zip(a[i].iter())
-                .map(|(pi_i, a_i_j)| pi_i * a_i_j)
-                .sum::<f64>();
-            let raw_exponent = sum - mu_not[i] / (R * temperature_k);
-            let log_value = ln_n + (STD_REFERENCE_PRESSURE / pressure_bar).ln() + raw_exponent;
-            let clamped = log_value > 650.0;
-            let value = log_value.min(650.0).exp();
-            (value, clamped)
-        };
-        let j_len = a[0].len();
+        n_g: &Vec<Species>,         // species pool
+        n_lm: &Vec<(f64, Species)>, // element pool
+        a: &Vec<Vec<f64>>,          // moles of element i in species j
+        b: &Vec<f64>,               // element totals, n_lm.0
+        mu_not: &Vec<f64>,
+    ) -> Option<Vec<(f64, Species)>> {
+        // Initialize
+        let mut enn: f64 = 0.1;
+        let mut ln_n = enn.ln();
+        let mut enln = vec![(enn / n_g.len() as f64).ln(); n_g.len()];
 
         let mut iterations = 0;
-        let mut final_n_vec = vec![];
-        let mut lambda = 1.0e-3;
-
         loop {
-            let (n_vec, f, j) = if iterations == 0 {
-                if let Some(uniform_n_vec) = &initial_uniform_n_vec {
-                    let (f, j) =
-                        residual_and_jacobian_from_n_vec(uniform_n_vec, ln_n, &a, &b);
-                    (uniform_n_vec.clone(), f, j)
-                } else {
-                    residual_and_jacobian(&pi, ln_n, &a, &b, &n)
-                }
-            } else {
-                residual_and_jacobian(&pi, ln_n, &a, &b, &n)
-            };
-            if f.norm() < 1.0e-6 {
-                final_n_vec = n_vec;
-                break;
-            }
+            let tm = (pressure_bar / enn).ln();
+            let en: Vec<f64> = enln.iter().map(|x| x.exp()).collect();
+            let mu: Vec<f64> = (0..n_g.len())
+                .map(|j| mu_not[j] / (R * temperature_k) + enln[j] + tm)
+                .collect();
+            let sumn: f64 = en.iter().sum();
 
-            if std::env::var("GIBBS_DEBUG").is_ok() && iterations % 50 == 0 {
-                println!(
-                    "=============== Iteration {} (lambda={:.3e}) ===============",
-                    iterations, lambda
-                );
-                println!("f.norm(): {:.3}", f.norm());
-                let mut ranked: Vec<(usize, f64)> =
-                    n_vec.iter().enumerate().map(|(i, &v)| (i, v)).collect();
-                ranked.sort_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap());
-                for (i, v) in ranked.iter().take(6) {
-                    println!(
-                        "species[{}] {} = {:.3e}, a[i] = {:?}",
-                        i,
-                        species_pool[*i].symbol(),
-                        v,
-                        a[*i]
-                    );
-                }
-            }
+            let m = n_lm.len();
 
-            if iterations == 4999 {
-                return None;
-            }
+            let mut g = DMatrix::zeros(m + 1, m + 1);
+            let mut rhs = DVector::zeros(m + 1);
+            (0..m).for_each(|i| {
+                (0..m).for_each(|k| {
+                    g[(i, k)] = (0..n_g.len())
+                        .map(|j| a[i][j] * a[k][j] * en[j])
+                        .sum::<f64>();
+                });
+                let sum = (0..n_g.len()).map(|j| a[i][j] * en[j]).sum();
+                g[(i, m)] = sum;
+                g[(m, i)] = sum;
+            });
+            g[(m, m)] = sumn - enn;
 
-            let current_norm = f.norm();
-            let jt = j.transpose();
-            let jtj = &jt * &j;
-            let neg_jtf = -(&jt * &f);
-            let mut accepted = false;
-            for _ in 0..50 {
-                let mut jtj_damped = jtj.clone();
-                for k in 0..(j_len + 1) {
-                    jtj_damped[(k, k)] += lambda * jtj[(k, k)].max(1.0e-10);
-                }
-                if let Some(delta) = jtj_damped.clone().lu().solve(&neg_jtf) {
-                    // Trust-region step limiter (NASA CEA-style): since pi/ln_n
-                    // feed an exp(), an unbounded Newton step can send some
-                    // species' moles to ~0 and others to overflow in one shot,
-                    // which then singularizes J on the next iteration. Cap the
-                    // largest per-step change so no n_i can move by more than
-                    // ~e^3 in a single iteration.
-                    let max_step = delta.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
-                    let alpha = if max_step > 2.0 { 2.0 / max_step } else { 1.0 };
+            (0..m).for_each(|i| {
+                let left: f64 = (0..n_g.len()).map(|j| a[i][j] * en[j] * mu[j]).sum();
+                let right: f64 = (0..n_g.len()).map(|j| a[i][j] * en[j]).sum();
+                rhs[i] = left + b[i] - right;
+            });
+            rhs[m] = (0..n_g.len()).map(|j| en[j] * mu[j]).sum::<f64>() + (enn - sumn);
 
-                    let trial_pi: Vec<f64> = (0..j_len).map(|k| pi[k] + alpha * delta[k]).collect();
-                    let trial_ln_n = ln_n + alpha * delta[j_len];
-                    let (_, trial_f, _) = residual_and_jacobian(&trial_pi, trial_ln_n, &a, &b, &n);
-                    if trial_f.iter().all(|v| v.is_finite()) && trial_f.norm() < current_norm {
-                        if std::env::var("GIBBS_DEBUG_FINE").is_ok() {
-                            println!(
-                                "iter={} alpha={:.3e} lambda={:.3e} norm {:.6e} -> {:.6e} (Δ={:.3e}%) max_step={:.3e}",
-                                iterations,
-                                alpha,
-                                lambda,
-                                current_norm,
-                                trial_f.norm(),
-                                100.0 * (current_norm - trial_f.norm()) / current_norm,
-                                max_step
-                            );
+            // Solve G*X = RHS using LU decomposition.
+            let x = g.lu().solve(&rhs)?;
+
+            // Calculate Deln.
+            let dln_n = x[m];
+            let deln: Vec<f64> = (0..n_g.len())
+                .map(|j| {
+                    let sum_a_pi: f64 = (0..m).map(|i| a[i][j] * x[i]).sum();
+                    -mu[j] + sum_a_pi + dln_n
+                })
+                .collect();
+
+            let mut ambda: f64 = 1.0;
+            let mut threshold = 5.0 * dln_n.abs();
+
+            // Step-size control for trace species.
+            for j in 0..n_g.len() {
+                if deln[j] > 0.0 {
+                    // Check if species is currently trace.
+                    // -9.21 corresponds to a mole fraction of ~1e-4.
+                    // Enln[j] far below Ennl -> enln[j] < ln_n - 9.21
+                    if enln[j] < ln_n - 9.21 {
+                        let gap = (deln[j] - dln_n).abs();
+                        if gap > 1.0e-8 {
+                            let candidate = (-9.21 - enln[j] + ln_n).abs() / gap;
+                            ambda = ambda.min(candidate);
                         }
-                        pi = trial_pi;
-                        ln_n = trial_ln_n;
-                        lambda *= 0.5;
-                        accepted = true;
-                        break;
+                    } else if deln[j] > threshold {
+                        threshold = deln[j];
                     }
-                    lambda *= 2.0;
                 }
             }
-            if !accepted {
-                return None;
+            if threshold > 2.0 {
+                ambda = ambda.min(2.0 / threshold);
+            }
+
+            // Update state variables using damped step.
+            ln_n += ambda * dln_n;
+            enn = ln_n.exp();
+
+            let mut max_update: f64 = 0.0;
+            for j in 0..n_g.len() {
+                let step = ambda * deln[j];
+                enln[j] += step;
+                max_update = max_update.max(step.abs());
+            }
+
+            // Convergence check.
+            if max_update < 1.0e-5 && (ambda * dln_n).abs() < 1.0e-5 {
+                // Return the converged product moles
+                let result: Vec<(f64, Species)> = enln
+                    .iter()
+                    .zip(n_g.iter())
+                    .map(|(log_n, species)| (log_n.exp(), species.clone()))
+                    .collect();
+                break Some(result); // Converged!
             }
 
             iterations += 1;
-        }
 
-        let products = final_n_vec
-            .iter()
-            .zip(species_pool.iter())
-            .map(|(&moles, &species)| (moles, species))
-            .collect::<Vec<(f64, Species)>>();
-
-        Some((products, pi, ln_n))
-    }
-
-    fn guess_pi_and_ln_n(
-        products: &Vec<(f64, Species)>,
-        temperature_k: f64,
-        pressure_bar: f64,
-        j_len: usize,
-        a: &Vec<Vec<f64>>,
-        mu_not: &Vec<f64>,
-        species_pool: &Vec<Species>,
-    ) -> (Vec<f64>, f64) {
-        // Base ln_n_guess off of starting moles of the system.
-        let ln_n_guess = products.iter().map(|(moles, _)| *moles).sum::<f64>().ln();
-
-        let total_moles: f64 = products.iter().map(|(moles, _)| *moles).sum();
-        let threshold = 1.0e-6; // relative to total system moles.
-
-        // Identify anchor species.
-        let anchors: Vec<(usize, f64)> = species_pool
-            .iter()
-            .enumerate() // TODO convert to filter_map?
-            .map(|(i, species)| {
-                // if species.is_charged() && *species != Species::E {
-                //     return None;
-                // }
-                let mut anchors_i = None;
-                for (moles, reactant) in products.iter() {
-                    if reactant == species && *moles / total_moles > threshold {
-                        anchors_i = Some((i, *moles));
-                    }
-                }
-                anchors_i
-            })
-            .filter_map(|anchors_i| anchors_i)
-            .collect();
-
-        // Build A (anchors.len() × j_len) and rhs (anchors.len()) from the anchor list:
-        //   A[row] = a[i]                                    for (i, feed_moles) in anchors
-        //   rhs[row] = ln(feed_moles) - ln_n_guess + mu_not[i]/(R*T) - ln(P_ref/P)
-
-        // Solve (AᵀA + eps·I) · pi = Aᵀ·rhs   instead of a plain square solve.
-        let mut a_ = vec![vec![0.0; j_len]; anchors.len()];
-        let mut rhs = vec![0.0; anchors.len()];
-        for (row, (i, feed_moles)) in anchors.iter().enumerate() {
-            for j in 0..j_len {
-                a_[row][j] = a[*i][j];
-                rhs[row] = feed_moles.ln() - ln_n_guess + mu_not[*i] / (R * temperature_k)
-                    - (STD_REFERENCE_PRESSURE / pressure_bar).ln();
+            if iterations == 5_000 {
+                break None;
             }
         }
-
-        let rows = anchors.len();
-        let flattened: Vec<f64> = a_.into_iter().flatten().collect();
-        let a_matrix = DMatrix::from_row_slice(rows, j_len, &flattened);
-        let rhs_vector = DVector::from_vec(rhs);
-
-        let ata = a_matrix.transpose() * &a_matrix; // j_len * j_len, symmeric
-        let atb = a_matrix.transpose() * &rhs_vector; // j_len
-
-        // ridge term, scaled to A transpose A's magnitude rather than a fixed constant
-        let eps = 1.0e-8 * ata.amax().max(1.0e-10);
-        let mut ata_reg = ata.clone();
-        for k in 0..j_len {
-            ata_reg[(k, k)] += eps;
-        }
-
-        let pi_guess: Vec<f64> = match ata_reg.lu().solve(&atb) {
-            Some(pi) => {
-                let pi: Vec<f64> = pi.iter().copied().collect();
-                let sane = species_pool.iter().enumerate().all(|(i, _)| {
-                    let dot: f64 = pi.iter().zip(a[i].iter()).map(|(p, aij)| p * aij).sum();
-                    let raw_exponent = dot - mu_not[i] / (R * temperature_k);
-                    raw_exponent < 50.0
-                });
-                if sane {
-                    pi
-                } else {
-                    // TODO revert
-                    pi /*vec![0.0; j_len]*/
-                }
-            }
-            _ => vec![0.0; j_len],
-        };
-
-        (pi_guess, ln_n_guess)
-    }
-
-    fn lp_seed_products(
-        temperature_k: f64,
-        j_len: usize,
-        a: &Vec<Vec<f64>>,
-        b: &Vec<f64>,
-        mu_not: &Vec<f64>,
-        species_pool: &Vec<Species>,
-    ) -> Vec<(f64, Species)> {
-        let mut vars = variables!();
-        let x: Vec<_> = species_pool
-            .iter()
-            .map(|_| vars.add(good_lp::variable().min(0.0)))
-            .collect();
-
-        // Objective: minimize sum(c_i * x_i), c_i = mu_not[i] / RT
-        let objective: good_lp::Expression = x
-            .iter()
-            .enumerate()
-            .map(|(i, &xi)| (mu_not[i] / (R * temperature_k)) * xi)
-            .sum();
-
-        let mut model = vars.minimise(objective).using(good_lp::clarabel);
-
-        // One equality constraint per element: sum_i a[i][j] * x_i == b[j]
-        let mut constraint_refs = Vec::with_capacity(j_len);
-        for j in 0..j_len {
-            let lhs: good_lp::Expression = x.iter().enumerate().map(|(i, &xi)| a[i][j] * xi).sum();
-            constraint_refs.push(model.add_constraint(constraint!(lhs == b[j])));
-        }
-
-        let solution = model.solve().expect("LP seed failed to solve");
-        let lp_moles: Vec<f64> = x.iter().map(|&xi| solution.value(xi)).collect();
-
-        let products: Vec<(f64, Species)> = lp_moles
-            .iter()
-            .zip(species_pool.iter())
-            .map(|(&moles, &species)| (moles, species))
-            .collect();
-
-        products
     }
 
     pub fn feed_mass(&self) -> f64 {
@@ -926,158 +435,11 @@ impl Mixture {
     }
 }
 
-fn residual_and_jacobian(
-    pi: &[f64],
-    ln_n: f64,
-    a: &Vec<Vec<f64>>,
-    b: &Vec<f64>,
-    n_i: &impl Fn(usize, &[f64], f64) -> (f64, bool),
-) -> (Vec<f64>, DVector<f64>, DMatrix<f64>) {
-    let i_len = a.len();
-    let mut n_vec = vec![0.0; i_len];
-    let mut clamped = vec![false; i_len];
-    for i in 0..i_len {
-        let (value, is_clamped) = n_i(i, pi, ln_n);
-        n_vec[i] = value;
-        clamped[i] = is_clamped;
-    }
-    // Clamped (overflowed) species don't get a vote in the mass-balance/
-    // Jacobian sums, but their raw n_i is still reported back to the caller.
-    let n_vec_for_matrix: Vec<f64> = n_vec
-        .iter()
-        .zip(clamped.iter())
-        .map(|(v, c)| if *c { 0.0 } else { *v })
-        .collect();
-    let (f_vec, j_matrix) = residual_and_jacobian_from_n_vec(&n_vec_for_matrix, ln_n, a, b);
-    (n_vec, f_vec, j_matrix)
-}
-
-/// Builds the residual and Jacobian directly from a given mole-number
-/// vector, independent of how those mole numbers were derived. Shared by
-/// `residual_and_jacobian` (which derives n_i from (pi, ln_n) via the usual
-/// exp() formula) and `uniform_guess_pi_and_ln_n` (which bootstraps from raw
-/// uniform mole numbers with no pi involved at all, mirroring how NASA CEA's
-/// own first iteration works — see that function's comment for why).
-fn residual_and_jacobian_from_n_vec(
-    n_vec: &[f64],
-    ln_n: f64,
-    a: &Vec<Vec<f64>>,
-    b: &Vec<f64>,
-) -> (DVector<f64>, DMatrix<f64>) {
-    let i_len = a.len();
-    let j_len = a[0].len();
-
-    let mut f_vec = vec![0.0; j_len + 1];
-    for j in 0..j_len {
-        let mut sum = 0.0;
-        for i in 0..i_len {
-            sum += n_vec[i] * a[i][j];
-        }
-        sum -= b[j];
-        f_vec[j] = sum;
-    }
-    let n_sum: f64 = n_vec.iter().sum();
-    f_vec[j_len] = n_sum - ln_n.exp();
-
-    let mut j_vec = vec![vec![0.0; j_len + 1]; j_len + 1];
-    for j in 0..j_len {
-        for k in 0..j_len {
-            let mut sum = 0.0;
-            for i in 0..i_len {
-                sum += n_vec[i] * a[i][j] * a[i][k];
-            }
-            j_vec[j][k] = sum;
-        }
-    }
-
-    for j in 0..j_len {
-        let mut sum = 0.0;
-        for i in 0..i_len {
-            sum += n_vec[i] * a[i][j];
-        }
-        j_vec[j][j_len] = sum;
-        j_vec[j_len][j] = sum;
-    }
-
-    j_vec[j_len][j_len] = n_sum - ln_n.exp();
-    let f_vec = DVector::from_vec(f_vec);
-    let flattened_j = j_vec.iter().flatten().map(|e| *e).collect();
-    // TODO from_vec expects column major data, but flatten gives row major data. It is fine because j_vec is symmetrical ie row count == col count
-    // but thats messy lets fix it.
-    let j_matrix = DMatrix::from_vec(j_len + 1, j_len + 1, flattened_j);
-    (f_vec, j_matrix)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn harness(
-        tr: &ThermoReference,
-        reactants: &Vec<(f64, Species)>,
-        temperature_k: f64,
-        pressure_bar: f64,
-    ) -> (Vec<f64>, f64, Vec<Species>, Vec<Vec<f64>>, Vec<f64>) {
-        let (species_pool, element_pool) = Mixture::reaction_pool(reactants);
-        // Precompute mu_not.
-        let mu_not = species_pool
-            .iter()
-            .map(|species| {
-                let tdp = tr.get_tdp(&species.symbol());
-                let mu_not_i = tdp.h(temperature_k) - temperature_k * tdp.s(temperature_k);
-                mu_not_i
-            })
-            .collect::<Vec<f64>>();
-
-        let a = species_pool
-            .iter()
-            .map(|species| {
-                let children = species.constituents();
-                element_pool
-                    .iter()
-                    .map(|(_, elem)| {
-                        children
-                            .iter()
-                            .find(|(_, child)| child == elem)
-                            .unwrap_or(&(0.0, *elem))
-                            .0
-                    })
-                    .collect::<Vec<f64>>()
-            })
-            .collect::<Vec<Vec<f64>>>();
-
-        let j_len = a[0].len();
-        // b_j is element_pool[j].0
-        let b = element_pool
-            .iter()
-            .map(|(moles, _)| *moles)
-            .collect::<Vec<f64>>();
-        let products =
-            &Mixture::lp_seed_products(temperature_k, j_len, &a, &b, &mu_not, &species_pool);
-        // println!("lp_seed_products: {:?}", products);
-        let (pi_guess, ln_n_guess) = Mixture::guess_pi_and_ln_n(
-            products,
-            temperature_k,
-            pressure_bar,
-            j_len,
-            &a,
-            &mu_not,
-            &species_pool,
-        );
-        // println!("reactant_pi_guess: {:?}", pi_guess);
-
-        (pi_guess, ln_n_guess, species_pool, a, b)
-    }
-
-    fn run_stability_suite(
-        tr: &ThermoReference,
-        solve: impl Fn(
-            &ThermoReference,
-            &Vec<(f64, Species)>,
-            f64,
-            f64,
-        ) -> Option<(Vec<(f64, Species)>, Vec<f64>, f64)>,
-    ) {
+    fn run_stability_suite(tr: &ThermoReference) {
         let reactants = vec![
             vec![(1.0, Species::H2O)],
             vec![(1.0, Species::CH4)],
@@ -1120,33 +482,60 @@ mod tests {
         let mut pass_fail = vec![vec![false; reactants.len()]; conditions.len()];
         for (i, (temperature_k, pressure_bar)) in conditions.iter().enumerate() {
             for (j, species) in reactants.iter().enumerate() {
-                let result = solve(tr, species, *temperature_k, *pressure_bar);
+                let (species_pool, element_pool) = Mixture::reaction_pool(&species);
+                let mu_not = species_pool
+                    .iter()
+                    .map(|species| {
+                        let tdp = tr.get_tdp(&species.symbol());
+                        let mu_not_i =
+                            tdp.h(*temperature_k) - temperature_k * tdp.s(*temperature_k);
+                        mu_not_i
+                    })
+                    .collect::<Vec<f64>>();
+                let a = element_pool
+                    .iter()
+                    .map(|(_, element)| {
+                        species_pool
+                            .iter()
+                            .map(|species| {
+                                let children = species.constituents();
+                                children
+                                    .iter()
+                                    .find(|(_, child)| child == element)
+                                    .unwrap_or(&(0.0, *element))
+                                    .0
+                            })
+                            .collect::<Vec<f64>>()
+                    })
+                    .collect::<Vec<Vec<f64>>>();
+                let b = element_pool
+                    .iter()
+                    .map(|(moles, _)| *moles)
+                    .collect::<Vec<f64>>();
+                let result = Mixture::solve_for_products(
+                    *temperature_k,
+                    *pressure_bar,
+                    &species_pool,
+                    &element_pool,
+                    &a,
+                    &b,
+                    &mu_not,
+                );
                 pass_fail[i][j] = result.is_some();
             }
         }
-        let mut header = "[K;bar]".to_string() + &" ".repeat(23);
-        conditions.iter().for_each(|(temperature_k, pressure_bar)| {
-            header += &format!("[{:e}; {:e}] ", temperature_k, pressure_bar)
-        });
-
         println!("========== Summary ==========");
-        println!("{}", header);
-        for (j, species) in reactants.iter().enumerate() {
-            let mut row = "".to_string();
-            let mut formula = "".to_string();
-            species.iter().for_each(|(moles, species)| {
-                formula += &format!("{:.2}•{} + ", moles, species.symbol())
-            });
-            formula.truncate(formula.len() - 3);
-            row += &format!("{:30}", formula);
-            for i in 0..conditions.len() {
-                if pass_fail[i][j] {
-                    row += "       ✓          ";
-                } else {
-                    row += "       𐄂          ";
-                }
-            }
-            println!("{}", row);
+        for (i, (temperature_k, pressure_bar)) in conditions.iter().enumerate() {
+            let total = pass_fail[i].len();
+            let test_passed = pass_fail[i].iter().filter(|&x| *x).count();
+            let row_header = &format!("({:.1} K; {:.1} bar) Results:", temperature_k, pressure_bar);
+            println!(
+                "{:>30} [{}/{}] {:.2}%",
+                row_header,
+                test_passed,
+                total,
+                100.0 * (test_passed as f64 / total as f64)
+            )
         }
         let test_passed = !pass_fail.iter().any(|inner| inner.iter().any(|x| !x));
         let percentage: f64 = pass_fail
@@ -1161,72 +550,45 @@ mod tests {
         );
     }
 
-    fn solve_lp_guess(
-        tr: &ThermoReference,
-        reactants: &Vec<(f64, Species)>,
-        temperature_k: f64,
-        pressure_bar: f64,
-    ) -> Option<(Vec<(f64, Species)>, Vec<f64>, f64)> {
-        let (pi_guess, ln_n_guess, species_pool, a, b) =
-            harness(tr, reactants, temperature_k, pressure_bar);
-        Mixture::solve_for_products(
-            tr,
-            temperature_k,
-            pressure_bar,
-            &pi_guess,
-            ln_n_guess,
-            &species_pool,
-            &a,
-            &b,
-        )
-    }
-
-    fn solve_uniform_start(
-        tr: &ThermoReference,
-        reactants: &Vec<(f64, Species)>,
-        temperature_k: f64,
-        pressure_bar: f64,
-    ) -> Option<(Vec<(f64, Species)>, Vec<f64>, f64)> {
-        let (species_pool, element_pool) = Mixture::reaction_pool(reactants);
-        let a = species_pool
-            .iter()
-            .map(|species| {
-                let children = species.constituents();
-                element_pool
-                    .iter()
-                    .map(|(_, elem)| {
-                        children
-                            .iter()
-                            .find(|(_, child)| child == elem)
-                            .unwrap_or(&(0.0, *elem))
-                            .0
-                    })
-                    .collect::<Vec<f64>>()
-            })
-            .collect::<Vec<Vec<f64>>>();
-        let b = element_pool
-            .iter()
-            .map(|(moles, _)| *moles)
-            .collect::<Vec<f64>>();
-        Mixture::solve_for_products_uniform_start(
-            tr,
-            temperature_k,
-            pressure_bar,
-            &species_pool,
-            &a,
-            &b,
-        )
-    }
-
     #[test]
     fn solve_for_products_stability() {
         let tr = &ThermoReference::new();
-        run_stability_suite(tr, solve_lp_guess);
+        run_stability_suite(tr);
     }
 
     #[test]
-    fn solve_for_products_stability_uniform_guess() {
+    fn solve_methane_combustion() {
         let tr = &ThermoReference::new();
-        run_stability_suite(tr, solve_uniform_start);
+        let reactants = vec![(1.0, Species::CH4), (1.0, Species::O2)];
+        let mixture = Mixture::new(tr, &reactants, 3_000.0, 50.0);
+        mixture.print_products();
+    }
+
+    #[test]
+    fn solve_ammonia_combustion() {
+        let tr = &ThermoReference::new();
+        let reactants = vec![(2.0, Species::NH3), (1.5, Species::O2)];
+        let mixture = Mixture::new(tr, &reactants, 300.0, 50.0);
+        mixture.print_products();
+    }
+
+    #[test]
+    fn solve_ions() {
+        let tr = &ThermoReference::new();
+        let reactants = vec![
+            (1.0, Species::CH4),
+            (1.0, Species::HPlus),
+            (1.0, Species::OHNeg),
+        ];
+        let mixture = Mixture::new(tr, &reactants, 300.0, 1.0);
+        mixture.print_products();
+    }
+
+    #[test]
+    fn solve_water() {
+        let tr = &ThermoReference::new();
+        let reactants = vec![(1.0, Species::H2O)];
+        let mixture = Mixture::new(tr, &reactants, 400.0, 50.0);
+        mixture.print_products();
     }
 }
