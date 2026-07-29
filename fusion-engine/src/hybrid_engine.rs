@@ -408,7 +408,7 @@ pub fn sweep_engine() {
     let aperture_diameter = 0.5e-3;
     let funnel_length = 7.0; // meters
     let t_allowed_max_chamber = 20_000.0; // When using water diluent
-    let chamber_pressure = 50.0;
+    let chamber_pressure = 10.0;
     let tr = ThermoReference::new();
 
     // Methane clathrate is CH4•5.75H2O
@@ -418,13 +418,11 @@ pub fn sweep_engine() {
         300.0,
         chamber_pressure,
     );
-    cations.print_products();
     let anions = Mixture::new(&tr, &vec![(1.0, Species::OHNeg)], 300.0, chamber_pressure);
-    anions.print_products();
-    let diluent = Mixture::new(&tr, &vec![(10.0, Species::H2O)], 1_000.0, chamber_pressure);
+    let diluent = Mixture::new(&tr, &vec![(38.00, Species::H2O)], 1_000.0, chamber_pressure);
     // TODO seems like raising chamber pressure, increases temperature, which lets
     // me lower theta, which converses more axial velocity!
-    let collision_theta_deg = 10.5;
+    let collision_theta_deg = 13.5;
     let coupling_efficiency = 0.05; // Higher because chamber has 6 moles of diluent plus disassociation
     let fixed_total_throat_area = None; // Derive area
     println!("===== Thrust Mode =====");
@@ -448,8 +446,9 @@ pub fn sweep_engine() {
 
     let diluent = Mixture::new(&tr, &vec![(1.0, Species::H2O)], 1_000.0, chamber_pressure);
 
-    let collision_theta_deg = 10.5;
-    let coupling_efficiency = 0.005; // Lower because chamber only has 1 mole H2
+    let collision_theta_deg = 10.0;
+    let coupling_efficiency = 0.0025; // Lower because the length of actual plasma in the chamber is less
+    // So there is less time for the plasma to couple energy with the diluetnt.
     println!("===== Isp Mode =====");
     calculate_engine_output(
         &tr,

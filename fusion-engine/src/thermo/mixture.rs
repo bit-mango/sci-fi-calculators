@@ -70,120 +70,128 @@ impl Mixture {
             .map(|(moles, _)| *moles)
             .collect::<Vec<f64>>();
         // Compute products given reactants and temperature_k.
-        // Compute guesses.
-        let (pi, ln_n) = Self::guess_pi_and_ln_n(
-            &reactants,
-            temperature_k,
-            pressure_bar,
-            j_len,
-            &a,
-            &mu_not,
-            &species_pool,
-        );
-        // Find the anchor, try target temperature first, if that fails iterate up and down from it.
-        let products = if let Some(ap) = Self::solve_for_products_with_clean_up(
-            tr,
-            temperature_k,
-            pressure_bar,
-            &pi,
-            ln_n,
-            &species_pool,
-            &a,
-            &b,
-        ) {
-            ap.0
+        let lp_reactants =
+            Mixture::lp_seed_products(temperature_k, j_len, &a, &b, &mu_not, &species_pool);
+        let products = if temperature_k < 1_000.0 {
+            // Just use the LP solution.
+            lp_reactants
         } else {
-            // Couldn't find anchor products so now recursively iterate to find the anchor, the walk it toward temperature_k
-            let step = 100.0;
-            let mut t_low = (temperature_k - (temperature_k % step)).max(200.0);
-            let mut t_high = t_low + step;
-            let mut anchor = None;
-            let mut anchor_temperature_k = 0.0;
-            let mut low_search_done = false;
-            let mut high_search_done = false;
+            // Compute guesses.
+            let (pi, ln_n) = Self::guess_pi_and_ln_n(
+                &lp_reactants,
+                temperature_k,
+                pressure_bar,
+                j_len,
+                &a,
+                &mu_not,
+                &species_pool,
+            );
+            // Find the anchor, try target temperature first, if that fails iterate up and down from it.
+            let products = if let Some(ap) = Self::solve_for_products_with_clean_up(
+                tr,
+                temperature_k,
+                pressure_bar,
+                &pi,
+                ln_n,
+                &species_pool,
+                &a,
+                &b,
+            ) {
+                ap.0
+            } else {
+                // Couldn't find anchor products so now recursively iterate to find the anchor, the walk it toward temperature_k
+                let step = 100.0;
+                let mut t_low = (temperature_k - (temperature_k % step)).max(200.0);
+                let mut t_high = t_low + step;
+                let mut anchor = None;
+                let mut anchor_temperature_k = 0.0;
+                let mut low_search_done = false;
+                let mut high_search_done = false;
 
-            while t_low > 200.0 || t_high < 20_000.0 {
-                if !low_search_done {
-                    if t_low == 200.0 {
-                        low_search_done = true;
+                while t_low > 200.0 || t_high < 20_000.0 {
+                    if !low_search_done {
+                        if t_low == 200.0 {
+                            low_search_done = true;
+                        }
+                        // Try t_low.
+                        let low_anchor = Self::solve_for_products_with_clean_up(
+                            tr,
+                            t_low,
+                            pressure_bar,
+                            &pi,
+                            ln_n,
+                            &species_pool,
+                            &a,
+                            &b,
+                        );
+                        if low_anchor.is_some() {
+                            anchor = low_anchor;
+                            anchor_temperature_k = t_low;
+                            break;
+                        }
                     }
-                    // Try t_low.
-                    let low_anchor = Self::solve_for_products_with_clean_up(
+                    if !high_search_done {
+                        if t_high == 20_000.0 {
+                            high_search_done = true;
+                        }
+                        // Try t_high.
+                        let high_anchor = Self::solve_for_products_with_clean_up(
+                            tr,
+                            t_high,
+                            pressure_bar,
+                            &pi,
+                            ln_n,
+                            &species_pool,
+                            &a,
+                            &b,
+                        );
+                        if high_anchor.is_some() {
+                            anchor = high_anchor;
+                            anchor_temperature_k = t_high;
+                            break;
+                        }
+                    }
+                    // Neither worked, adjust t_low, and t_high.
+                    t_low = (t_low - step).max(200.0);
+                    t_high = (t_high + step).min(20_000.0);
+                }
+                let products;
+                if let Some(anc) = anchor {
+                    let next_anchor = Self::walk_anchor(
                         tr,
-                        t_low,
-                        pressure_bar,
-                        &pi,
-                        ln_n,
+                        anchor_temperature_k,
+                        &anc.1,
+                        anc.2,
                         &species_pool,
                         &a,
                         &b,
-                    );
-                    if low_anchor.is_some() {
-                        anchor = low_anchor;
-                        anchor_temperature_k = t_low;
-                        break;
-                    }
-                }
-                if !high_search_done {
-                    if t_high == 20_000.0 {
-                        high_search_done = true;
-                    }
-                    // Try t_high.
-                    let high_anchor = Self::solve_for_products_with_clean_up(
-                        tr,
-                        t_high,
+                        temperature_k,
                         pressure_bar,
-                        &pi,
-                        ln_n,
-                        &species_pool,
-                        &a,
-                        &b,
                     );
-                    if high_anchor.is_some() {
-                        anchor = high_anchor;
-                        anchor_temperature_k = t_high;
-                        break;
-                    }
-                }
-                // Neither worked, adjust t_low, and t_high.
-                t_low = (t_low - step).max(200.0);
-                t_high = (t_high + step).min(20_000.0);
-            }
-            let products;
-            if let Some(anc) = anchor {
-                let next_anchor = Self::walk_anchor(
-                    tr,
-                    anchor_temperature_k,
-                    &anc.1,
-                    anc.2,
-                    &species_pool,
-                    &a,
-                    &b,
-                    temperature_k,
-                    pressure_bar,
-                );
-                if let Some(next) = next_anchor {
-                    // We are done!
-                    products = Some(next.0);
-                } else {
-                    panic!(
-                        "Could not converge to answer!
+                    if let Some(next) = next_anchor {
+                        // We are done!
+                        products = Some(next.0);
+                    } else {
+                        panic!(
+                            "Could not converge to answer!
                                 Temperature wanted: {:.3} K
                                 Temperature walked to: {:.3} K",
-                        temperature_k, anchor_temperature_k
-                    )
+                            temperature_k, anchor_temperature_k
+                        )
+                    }
+                } else {
+                    println!(
+                        "Failed to find anchor for temperature: {:.3}. t_low={:.3} t_high={:.3}\nreactants={:?}",
+                        temperature_k, t_low, t_high, reactants
+                    );
+                    panic!("Unable to find anchor point!");
                 }
-            } else {
-                println!(
-                    "Failed to find anchor for temperature: {:.3}. t_low={:.3} t_high={:.3}\nreactants={:?}",
-                    temperature_k, t_low, t_high, reactants
-                );
-                panic!("Unable to find anchor point!");
-            }
-            products.expect(&format!(
-                "Anchor walk did not converge to {:.3} K (last anchor at {:.3} K)",
-                temperature_k, anchor_temperature_k
-            ))
+                products.expect(&format!(
+                    "Anchor walk did not converge to {:.3} K (last anchor at {:.3} K)",
+                    temperature_k, anchor_temperature_k
+                ))
+            };
+            products
         };
         // every 1_000 K until we find a solution. This is our anchor
         // Move the anchor closer to temperature_k until we get it backing off half the distance on fail.
@@ -623,6 +631,23 @@ impl Mixture {
                 break;
             }
 
+            if iterations % 1_000 == 0 {
+                println!("=============== Iteration {} ===============", iterations);
+                println!("f.norm(): {:.3}", f.norm());
+                let mut ranked: Vec<(usize, f64)> =
+                    n_vec.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+                ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                for (i, v) in ranked.iter().take(5) {
+                    println!(
+                        "species[{}] {} = {:.3e}, a[i] = {:?}",
+                        i,
+                        species_pool[*i].symbol(),
+                        v,
+                        a[*i]
+                    );
+                }
+            }
+
             if iterations == 4999 {
                 return None;
             }
@@ -653,7 +678,7 @@ impl Mixture {
                     // largest per-step change so no n_i can move by more than
                     // ~e^3 in a single iteration.
                     let max_step = delta.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
-                    let alpha = if max_step > 3.0 { 3.0 / max_step } else { 1.0 };
+                    let alpha = if max_step > 2.0 { 2.0 / max_step } else { 1.0 };
 
                     let trial_pi: Vec<f64> = (0..j_len).map(|k| pi[k] + alpha * delta[k]).collect();
                     let trial_ln_n = ln_n + alpha * delta[j_len];
@@ -756,7 +781,12 @@ impl Mixture {
                     let raw_exponent = dot - mu_not[i] / (R * temperature_k);
                     raw_exponent < 50.0
                 });
-                if sane { pi } else { vec![0.0; j_len] }
+                if sane {
+                    pi
+                } else {
+                    // TODO revert
+                    pi /*vec![0.0; j_len]*/
+                }
             }
             _ => vec![0.0; j_len],
         };
@@ -802,10 +832,6 @@ impl Mixture {
             .zip(species_pool.iter())
             .map(|(&moles, &species)| (moles, species))
             .collect();
-
-        products.iter().for_each(|(moles, species)| {
-            println!("{:.2}•{}", moles, species.symbol());
-        });
 
         products
     }
@@ -890,19 +916,13 @@ fn residual_and_jacobian(
 mod tests {
     use super::*;
 
-    #[test]
-    fn solve_for_products_stability() {
-        let tr = &ThermoReference::new();
-        let temperature_k = 800.0;
-        let pressure_bar = 50.0;
-        // let products = &vec![(1.0, Species::H2O)];
-        // let products = &vec![(1.0, Species::CH4), (2.0, Species::O2)];
-        let products = &vec![
-            (1.0, Species::CH4),
-            (1.0, Species::HPlus),
-            (1.0, Species::OHNeg),
-        ];
-        let (species_pool, element_pool) = Mixture::reaction_pool(products);
+    fn harness(
+        tr: &ThermoReference,
+        reactants: &Vec<(f64, Species)>,
+        temperature_k: f64,
+        pressure_bar: f64,
+    ) -> (Vec<f64>, f64, Vec<Species>, Vec<Vec<f64>>, Vec<f64>) {
+        let (species_pool, element_pool) = Mixture::reaction_pool(reactants);
         // Precompute mu_not.
         let mu_not = species_pool
             .iter()
@@ -950,22 +970,85 @@ mod tests {
         );
         println!("reactant_pi_guess: {:?}", pi_guess);
 
-        let result = Mixture::solve_for_products(
-            tr,
-            temperature_k,
-            pressure_bar,
-            &pi_guess,
-            ln_n_guess,
-            &species_pool,
-            &a,
-            &b,
+        (pi_guess, ln_n_guess, species_pool, a, b)
+    }
+
+    #[test]
+    fn solve_for_products_stability() {
+        let tr = &ThermoReference::new();
+        let reactants = vec![
+            vec![(1.0, Species::H2O)],
+            vec![(1.0, Species::CH4)],
+            vec![(1.0, Species::CH4), (2.0, Species::O2)],
+            vec![(1.0, Species::CH4), (1.0, Species::O)],
+            vec![
+                (1.0, Species::CH4),
+                (1.0, Species::HPlus),
+                (1.0, Species::OHNeg),
+            ],
+        ];
+        let conditions = vec![
+            (300.0, 50.0),
+            (1_000.0, 50.0),
+            (3_000.0, 50.0),
+            (5_000.0, 50.0),
+            (10_000.0, 50.0),
+            (20_000.0, 50.0),
+        ];
+        let mut pass_fail = vec![vec![false; reactants.len()]; conditions.len()];
+        for (i, (temperature_k, pressure_bar)) in conditions.iter().enumerate() {
+            for (j, species) in reactants.iter().enumerate() {
+                let (pi_guess, ln_n_guess, species_pool, a, b) =
+                    harness(tr, species, *temperature_k, *pressure_bar);
+
+                let result = Mixture::solve_for_products(
+                    tr,
+                    *temperature_k,
+                    *pressure_bar,
+                    &pi_guess,
+                    ln_n_guess,
+                    &species_pool,
+                    &a,
+                    &b,
+                );
+
+                pass_fail[i][j] = result.is_some();
+            }
+        }
+        let mut header = " ".repeat(30).to_string();
+        conditions.iter().for_each(|(temperature_k, pressure_bar)| {
+            header += &format!("({:e} K; {:e} bar)  ", temperature_k, pressure_bar)
+        });
+
+        println!("========== Summary ==========");
+        println!("{}", header);
+        for (j, species) in reactants.iter().enumerate() {
+            let mut row = "".to_string();
+            let mut formula = "".to_string();
+            species.iter().for_each(|(moles, species)| {
+                formula += &format!("{:.2}•{} + ", moles, species.symbol())
+            });
+            formula.truncate(formula.len() - 3);
+            row += &format!("{:30}", formula);
+            for i in 0..conditions.len() {
+                if pass_fail[i][j] {
+                    row += "       ✓          ";
+                } else {
+                    row += "       𐄂          ";
+                }
+            }
+            println!("{}", row);
+        }
+        // assert!(
+        //     result.is_some(),
+        //     "Failed to find result for temperature_k: {:.3} K, pressure_bar: {:.3} bar \n{:?}",
+        //     temperature_k,
+        //     pressure_bar,
+        //     reactants
+        // );
+        assert!(
+            !pass_fail.iter().any(|inner| inner.iter().any(|x| !x)),
+            "Failed to find product for scenario(s)"
         );
-
-        assert!(result.is_some(), "Failed to find result");
-
-        let (products, _, _) = result.unwrap();
-        products
-            .iter()
-            .for_each(|(moles, species)| println!("{:.2}•{}", moles, species.symbol()));
     }
 }
