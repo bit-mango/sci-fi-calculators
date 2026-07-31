@@ -36,3 +36,33 @@ pub struct SpeciesData<const C: usize, const T: usize> {
     pub h_formation: f64,
     pub phase: u8,
 }
+
+pub trait AnySpeciesData {
+    fn symbol(&self) -> &str;
+    fn constituents(&self) -> &[(f64, Element)];
+    fn temperature_data(&self) -> &[(f64, f64, [f64; 9])];
+    fn mw(&self) -> f64;
+    fn h_formation(&self) -> f64;
+    fn phase(&self) -> u8;
+}
+
+impl<const C: usize, const T: usize> AnySpeciesData for SpeciesData<C, T> {
+    fn symbol(&self) -> &str {
+        self.symbol
+    }
+    fn constituents(&self) -> &[(f64, Element)] {
+        &self.constituents
+    }
+    fn temperature_data(&self) -> &[(f64, f64, [f64; 9])] {
+        &self.temperature_data
+    }
+    fn mw(&self) -> f64 {
+        self.mw
+    }
+    fn h_formation(&self) -> f64 {
+        self.h_formation
+    }
+    fn phase(&self) -> u8 {
+        self.phase
+    }
+}

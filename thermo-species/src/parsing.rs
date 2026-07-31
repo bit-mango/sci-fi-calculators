@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 fn clean_identifier(raw_identifier: &str) -> String {
     let mut cleaned_identifier = raw_identifier.to_string();
     // Special naming for electrons.

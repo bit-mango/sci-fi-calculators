@@ -42,9 +42,12 @@ fn main() {
     // types::SpeciesData
 
     let mut buffer = String::new();
-    writeln!(&mut buffer, "#[allow(non_upper_case)]").unwrap();
-    writeln!(&mut buffer, "use crate::types::{{Element, SpeciesData}};").unwrap();
-    let mut condensed_phases: HashMap<String, Vec<String>> = HashMap::new();
+    // writeln!(&mut buffer, "#[allow(non_upper_case)]").unwrap();
+    writeln!(
+        &mut buffer,
+        "pub use crate::types::{{Element, SpeciesData, AnySpeciesData}};"
+    )
+    .unwrap();
     // Key is the identifier without '_phase' at end.
     // Value is vec of identifiers.
     // Example:
@@ -73,23 +76,6 @@ fn main() {
 
         if cleaned_species_identifier.starts_with("Inert") {
             continue;
-        }
-
-        // Update condensed phase.
-        let key = if phase == 0 {
-            // Key is just cleaned identifier.
-            cleaned_species_identifier.clone()
-        } else {
-            let idx_phase_start = cleaned_species_identifier.rfind("_").unwrap();
-            let mut identifier_no_phase = cleaned_species_identifier.clone();
-            let _ = identifier_no_phase.split_off(idx_phase_start);
-            identifier_no_phase
-        };
-        // Update condensed_phase
-        if let Some(entry) = condensed_phases.get_mut(&key) {
-            entry.push(cleaned_species_identifier.clone());
-        } else {
-            condensed_phases.insert(key, vec![cleaned_species_identifier.clone()]);
         }
 
         // Consolidate species.
@@ -147,6 +133,9 @@ fn main() {
         }
     }
 
+    let mut all = vec![];
+    let mut condensed_phases: HashMap<String, Vec<String>> = HashMap::new();
+
     let mut consolidated_species = species.drain().collect::<Vec<(
         String,
         (
@@ -165,6 +154,32 @@ fn main() {
                 cleaned_temperature_data,
             ),
         )| {
+            // Update condensed phase.
+            let key = if *phase == 0 {
+                // Key is just cleaned identifier.
+                cleaned_species_identifier.clone()
+            } else {
+                let idx_phase_start = cleaned_species_identifier.rfind("_").unwrap();
+                let mut identifier_no_phase = cleaned_species_identifier.clone();
+                let _ = identifier_no_phase.split_off(idx_phase_start);
+                identifier_no_phase
+            };
+            // Update condensed_phase
+            if let Some(entry) = condensed_phases.get_mut(&key) {
+                if *phase != 0 {
+                    entry.push(cleaned_species_identifier.clone());
+                }
+            } else {
+                let mut phases = vec![];
+                if *phase != 0 {
+                    phases.push(cleaned_species_identifier.clone());
+                }
+                condensed_phases.insert(key, phases);
+            }
+
+            // Add each species to the all vec.
+            all.push(cleaned_species_identifier.clone());
+
             let c = constituents.len();
             let t = cleaned_temperature_data.len();
             // Add beginning of static species.
@@ -206,8 +221,57 @@ fn main() {
         },
     );
 
+    // Add Species enum.
+    write!(&mut buffer, "pub enum Species {{").unwrap();
+    for species in all.iter() {
+        write!(&mut buffer, "{},", species).unwrap();
+    }
+    writeln!(&mut buffer, "}}").unwrap();
+
+    write!(&mut buffer, "impl Species {{").unwrap();
+    // Add phases
+    write!(&mut buffer, "pub fn phases(&self) -> &'static [Species] {{").unwrap();
+    write!(&mut buffer, "match self {{").unwrap();
+    condensed_phases.iter().for_each(|(base, phases)| {
+        let base_is_real = all.contains(base);
+        let mut left = if base_is_real {
+            format!("Species::{}", base)
+        } else {
+            String::new()
+        };
+        let mut right = "&[".to_string();
+        phases.iter().for_each(|phase| {
+            left += &format!(" | Species::{}", phase);
+            right += &format!("Species::{},", phase);
+        });
+        right += "],";
+        write!(&mut buffer, "{} => {}", left, right).unwrap();
+    });
+    // Close match arm
+    write!(&mut buffer, "}}").unwrap();
+    // Close fn definition
+    writeln!(&mut buffer, "}}").unwrap();
+
+    // Add data
+    write!(
+        &mut buffer,
+        "pub fn data(&self) -> &'static dyn AnySpeciesData {{"
+    )
+    .unwrap();
+    write!(&mut buffer, "match self {{").unwrap();
+    all.iter().for_each(|species| {
+        write!(&mut buffer, "Species::{} => &{},", species, species).unwrap();
+    });
+    // Close match arm
+    write!(&mut buffer, "}}").unwrap();
+    // Close fn definition
+    write!(&mut buffer, "}}").unwrap();
+
+    // Close the implementation.
+    write!(&mut buffer, "}}").unwrap();
+
     let out_dir = env::var_os("OUT_DIR").unwrap();
-    let dest_path = Path::new(&out_dir).join("generated_sample.rs");
+    let dest_path = Path::new(&out_dir).join("thermo.rs");
     fs::write(&dest_path, buffer).unwrap();
 
     // use write! and writeln! macros for building string.
