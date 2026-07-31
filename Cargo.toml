@@ -1,4 +1,4 @@
 [workspace]
-members = ["fusion-engine", "mission-design"]
+members = ["fusion-engine", "mission-design", "thermo-species"]
 
 resolver = "2"

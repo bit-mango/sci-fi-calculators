@@ -415,7 +415,7 @@ pub fn sweep_engine() {
     let cations = Mixture::new(
         &tr,
         &vec![(1.0, Species::CH4), (1.0, Species::HPlus)], // Stand in for CH5+ which there is no CEA data for.
-        300.0,
+        373.0,
         chamber_pressure,
     );
     let anions = Mixture::new(&tr, &vec![(1.0, Species::OHNeg)], 300.0, chamber_pressure);

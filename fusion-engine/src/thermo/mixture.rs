@@ -585,6 +585,15 @@ mod tests {
     }
 
     #[test]
+    fn solve_smr() {
+        // Steam Reforming Methane
+        let tr = &ThermoReference::new();
+        let reactants = vec![(1.0, Species::CH4), (1.0, Species::H2O)];
+        let mixture = Mixture::new(tr, &reactants, 1_273.0, 1.0);
+        mixture.print_products();
+    }
+
+    #[test]
     fn solve_water() {
         let tr = &ThermoReference::new();
         let reactants = vec![(1.0, Species::H2O)];
