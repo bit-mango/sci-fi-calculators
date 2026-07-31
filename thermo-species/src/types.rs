@@ -51,6 +51,9 @@ pub struct SpeciesData<const C: usize, const T: usize> {
     pub temperature_data: [(f64, f64, [f64; 9]); T],
     pub mw: f64,
     pub h_formation: f64,
+    /// 0 = gas, non-zero = condensed. The specific non-zero value is not
+    /// semantically meaningful (NASA's raw record ordinal, not a phase ID)
+    /// and is arbitrary after lambda-transition merging.
     pub phase: u8,
 }
 

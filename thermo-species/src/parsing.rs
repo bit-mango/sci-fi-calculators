@@ -73,13 +73,12 @@ fn clean_identifier(raw_identifier: &str) -> String {
     cleaned_identifier
 }
 
+pub type Metadata = (usize, Vec<(f64, String)>, u8, f64, f64);
+pub type TemperatureData = Vec<(f64, f64, Vec<f64>)>;
+
 pub fn process_entry(
     iter: &mut impl Iterator<Item = String>,
-) -> (
-    (String, String),
-    (usize, Vec<(f64, String)>, u8, f64, f64),
-    Vec<(f64, f64, Vec<f64>)>,
-) {
+) -> ((String, String), Metadata, TemperatureData) {
     // Get entry header.
     let header = iter.next().unwrap();
     let species_identifier = header.split(" ").collect::<Vec<&str>>()[0];
@@ -106,17 +105,21 @@ fn parse_temperature_data(iter: &mut impl Iterator<Item = String>) -> (f64, f64,
     let temperature_low = &temperature_header[0..11]
         .trim()
         .parse::<f64>()
-        .expect(&format!(
-            "Failed to read lower temperature range: {}",
-            &temperature_header[0..11]
-        ));
+        .unwrap_or_else(|_| {
+            panic!(
+                "Failed to read lower temperature range: {}",
+                &temperature_header[0..11]
+            )
+        });
     let temperature_high = &temperature_header[11..22]
         .trim()
         .parse::<f64>()
-        .expect(&format!(
-            "Failed to read upper temperature range: {}",
-            &temperature_header[11..22]
-        ));
+        .unwrap_or_else(|_| {
+            panic!(
+                "Failed to read upper temperature range: {}",
+                &temperature_header[11..22]
+            )
+        });
 
     // First 5 coefficients.
     let mut coefficients = vec![0.0; 9];
@@ -124,15 +127,17 @@ fn parse_temperature_data(iter: &mut impl Iterator<Item = String>) -> (f64, f64,
     let mut i = 0;
     while i < 5 {
         let idx = i * 16;
-        coefficients[i] = *&coefficients_row[idx..(idx + 16)]
+        coefficients[i] = coefficients_row[idx..(idx + 16)]
             .trim()
             .replace("D", "e")
             .parse::<f64>()
-            .expect(&format!(
-                "Failed to parse coefficient[{}]: {}",
-                i,
-                &coefficients_row[0..16]
-            ));
+            .unwrap_or_else(|_| {
+                panic!(
+                    "Failed to parse coefficient[{}]: {}",
+                    i,
+                    &coefficients_row[0..16]
+                )
+            });
 
         i += 1;
     }
@@ -142,15 +147,17 @@ fn parse_temperature_data(iter: &mut impl Iterator<Item = String>) -> (f64, f64,
     let coefficients_row = iter.next().unwrap();
     while i < 2 {
         let idx = i * 16;
-        coefficients[i + offset] = *&coefficients_row[idx..(idx + 16)]
+        coefficients[i + offset] = coefficients_row[idx..(idx + 16)]
             .trim()
             .replace("D", "e")
             .parse::<f64>()
-            .expect(&format!(
-                "Failed to parse coefficient[{}]: {}",
-                i,
-                &coefficients_row[idx..(idx + 16)]
-            ));
+            .unwrap_or_else(|_| {
+                panic!(
+                    "Failed to parse coefficient[{}]: {}",
+                    i,
+                    &coefficients_row[idx..(idx + 16)]
+                )
+            });
 
         i += 1;
     }
@@ -158,15 +165,17 @@ fn parse_temperature_data(iter: &mut impl Iterator<Item = String>) -> (f64, f64,
         // Need to skip white space separating a and b coefficients.
         // So add 16.
         let idx = i * 16 + 16;
-        coefficients[i + offset] = *&coefficients_row[idx..(idx + 16)]
+        coefficients[i + offset] = coefficients_row[idx..(idx + 16)]
             .trim()
             .replace("D", "e")
             .parse::<f64>()
-            .expect(&format!(
-                "Failed to parse coefficient[{}]: {}",
-                i,
-                &coefficients_row[idx..(idx + 16)]
-            ));
+            .unwrap_or_else(|_| {
+                panic!(
+                    "Failed to parse coefficient[{}]: {}",
+                    i,
+                    &coefficients_row[idx..(idx + 16)]
+                )
+            });
 
         i += 1;
     }
@@ -177,10 +186,12 @@ fn parse_metadata(raw_metadata: &str) -> (usize, Vec<(f64, String)>, u8, f64, f6
     let temperature_intervals = &raw_metadata[0..2]
         .trim() // Remove white space
         .parse::<usize>()
-        .expect(&format!(
-            "Failed to parse temperature intervals: {}",
-            &raw_metadata[0..2]
-        ));
+        .unwrap_or_else(|_| {
+            panic!(
+                "Failed to parse temperature intervals: {}",
+                &raw_metadata[0..2]
+            )
+        });
 
     let mut constituents = vec![];
     let raw_constituents = &raw_metadata[10..50];
@@ -188,14 +199,14 @@ fn parse_metadata(raw_metadata: &str) -> (usize, Vec<(f64, String)>, u8, f64, f6
         let idx = i * 8;
         let constituent = &raw_constituents[idx..(idx + 8)];
         let name = constituent[0..2].trim().to_string();
-        if name == "" {
+        if name.is_empty() {
             // Once we find this we have processed all the constiuents.
             break;
         }
-        let moles = constituent[2..8].trim().parse::<f64>().expect(&format!(
-            "Failed to parse moles from constituent: {}",
-            constituent
-        ));
+        let moles = constituent[2..8]
+            .trim()
+            .parse::<f64>()
+            .unwrap_or_else(|_| panic!("Failed to parse moles from constituent: {}", constituent));
         let element = if name.len() >= 2 {
             // Make sure the second letter is lower case.
             name.chars()
@@ -208,19 +219,30 @@ fn parse_metadata(raw_metadata: &str) -> (usize, Vec<(f64, String)>, u8, f64, f6
         constituents.push((moles, element));
     }
 
-    let phase = *&raw_metadata[50..52]
+    let phase = raw_metadata[50..52]
         .trim()
         .parse::<i32>()
-        .expect(&format!("Failed to parse phase: {}", &raw_metadata[50..52])) as u8;
+        .unwrap_or_else(|_| panic!("Failed to parse phase: {}", &raw_metadata[50..52]))
+        as u8;
 
-    let mw = &raw_metadata[52..65].trim().parse::<f64>().expect(&format!(
-        "Failed to parse molecular weight: {}",
-        &raw_metadata[52..65]
-    ));
-    let std_heat_of_formation = &raw_metadata[65..80].trim().parse::<f64>().expect(&format!(
-        "Failed to parse std heat of formation: {}",
-        &raw_metadata[65..80]
-    ));
+    let mw = &raw_metadata[52..65]
+        .trim()
+        .parse::<f64>()
+        .unwrap_or_else(|_| {
+            panic!(
+                "Failed to parse molecular weight: {}",
+                &raw_metadata[52..65]
+            )
+        });
+    let std_heat_of_formation = &raw_metadata[65..80]
+        .trim()
+        .parse::<f64>()
+        .unwrap_or_else(|_| {
+            panic!(
+                "Failed to parse std heat of formation: {}",
+                &raw_metadata[65..80]
+            )
+        });
 
     (
         *temperature_intervals,

@@ -7,3 +7,4 @@ edition = "2024"
 integrate = "0.3.1"
 nalgebra = "0.35.0"
 good_lp = {version = "1.15.2", default-features = false, features = ["clarabel"]}
+thermo-species = { path = "../thermo-species" }

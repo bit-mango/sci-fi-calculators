@@ -137,6 +137,7 @@ dependencies = [
  "good_lp",
  "integrate",
  "nalgebra",
+ "thermo-species",
 ]
 
 [[package]]

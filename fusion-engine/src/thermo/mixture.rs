@@ -4,6 +4,7 @@ use crate::thermo::fluid_properties::{TemperatureDependentProperty, ThermoRefere
 use nalgebra::{DMatrix, DVector};
 use std::collections::HashMap;
 use std::f64;
+use thermo_species::Element;
 
 #[derive(Clone, Default)]
 pub struct Mixture {

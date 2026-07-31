@@ -12,15 +12,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo::rerun-if-changed=src/types.rs");
     let custom_thermo_inp = env::var_os("THERMO_INP_PATH");
     let thermo_inp_contents = if let Some(custom) = custom_thermo_inp {
-        println!("cargo::rerun-if-changed={:?}", &custom);
-        let contents =
-            fs::read_to_string(&custom).expect(&format!("Failed to read file: {:?}", custom));
-        contents
+        println!("cargo::rerun-if-changed={:?}", custom.to_string_lossy());
+        fs::read_to_string(&custom).unwrap_or_else(|_| panic!("Failed to read file: {:?}", custom))
     } else {
         let default = "data/thermo.inp";
-        let contents =
-            fs::read_to_string(&default).expect(&format!("Failed to read file: {:?}", default));
-        contents
+        fs::read_to_string(default).unwrap_or_else(|_| panic!("Failed to read file: {:?}", default))
     };
     let thermo_inp_cleaned: Vec<String> = thermo_inp_contents
         .split("\n") // Convert file into vec of full lines
@@ -43,23 +39,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             iter.next(); // Throw out every line until we hit the first specimen.
         }
     }
-    // types::SpeciesData
 
     let mut buffer = String::new();
-    // writeln!(&mut buffer, "#[allow(non_upper_case)]")?;
     writeln!(
         &mut buffer,
         "pub use crate::types::{{Element, SpeciesData, AnySpeciesData, ParseSpeciesError}};"
     )?;
-
-    let mut species: HashMap<
-        String,
-        (
-            String,
-            (usize, Vec<(f64, String)>, u8, f64, f64),
-            Vec<(f64, f64, Vec<f64>)>,
-        ),
-    > = HashMap::new();
+    let mut species: HashMap<String, (String, parsing::Metadata, parsing::TemperatureData)> =
+        HashMap::new();
     while iter
         .peek()
         .ok_or("reached end of input before \"END PRODUCTS\"")?
@@ -78,7 +65,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Consolidate species.
         if let Some(entry) = species.get_mut(&cleaned_species_identifier) {
             // Exact species already exists, check they are the same, and append temperature data together.
-            if entry.0 != dirty_species_identifier || entry.1.3 != mw || entry.1.4 != h_formation {
+            if entry.0 != dirty_species_identifier
+                || entry.1.3 != mw
+                || entry.1.4 != h_formation
+                || entry.1.1 != constituents
+            {
                 panic!("Species have the exact same name, but different data!");
             }
             let current_temperature_data = entry.2.clone();
@@ -156,10 +147,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Key is just cleaned identifier.
             cleaned_species_identifier.clone()
         } else {
-            let idx_phase_start = cleaned_species_identifier.rfind("__").expect(&format!(
-                "Failed to find phase in: {}",
-                cleaned_species_identifier
-            ));
+            let idx_phase_start = cleaned_species_identifier.rfind("__").unwrap_or_else(|| {
+                panic!("Failed to find phase in: {}", cleaned_species_identifier)
+            });
             let mut identifier_no_phase = cleaned_species_identifier.clone();
             let _ = identifier_no_phase.split_off(idx_phase_start);
             identifier_no_phase
@@ -321,7 +311,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     write!(
         &mut buffer,
-        "($other:literal) => {{ compile_error!(concat!(\"Unkown species: \", $other))}}",
+        "($other:literal) => {{ compile_error!(concat!(\"Unknown species: \", $other))}}",
     )?;
     // Close the macro
     writeln!(&mut buffer, "}}")?;
