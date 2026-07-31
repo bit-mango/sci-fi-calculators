@@ -31,6 +31,12 @@ fn clean_identifier(raw_identifier: &str) -> String {
         identifier.next_back(); // Remove trailing '_'.
         cleaned_identifier = identifier.as_str().to_string();
     }
+    // Remove leading '_' if present.
+    if cleaned_identifier.starts_with("_") {
+        let mut identifier = cleaned_identifier.chars();
+        identifier.next(); // Remove leading '_'.
+        cleaned_identifier = identifier.as_str().to_string();
+    }
     cleaned_identifier
 }
 
