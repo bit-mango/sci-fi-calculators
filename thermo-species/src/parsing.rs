@@ -1,10 +1,45 @@
 #![allow(dead_code)]
+
+static PHASE_IDENTIFIERS: [(&str, &str); 24] = [
+    ("(a)", "__a"),
+    ("(an)", "__an"),
+    ("(a')", "__aPrime"),
+    ("(b)", "__b"),
+    ("(c)", "__c"),
+    ("(d)", "__d"),
+    ("(g)", "__g"),
+    ("(gr)", "__gr"),
+    ("(L)", "__L"),
+    ("(cr)", "__cr"),
+    ("(crI)", "__crI"),
+    ("(crII)", "__crII"),
+    ("(I)", "__I"),
+    ("(I')", "__IPrime"),
+    ("(II)", "__II"),
+    ("(III)", "__III"),
+    ("(III,II)", "__III_II"),
+    ("(IV)", "__IV"),
+    ("(V)", "__V"),
+    ("(II-r)", "__IINegr"),
+    ("(I-y)", "__INegy"),
+    ("(a-qz)", "__aNegqz"),
+    ("(b-crt)", "__bNegcrt"),
+    ("(b-qz)", "__bNegqz"),
+];
 fn clean_identifier(raw_identifier: &str) -> String {
     let mut cleaned_identifier = raw_identifier.to_string();
     // Special naming for electrons.
     if cleaned_identifier == "e-" {
         cleaned_identifier = "E".to_string();
     }
+
+    // Check for phase.
+    for identifier in PHASE_IDENTIFIERS {
+        if cleaned_identifier.contains(identifier.0) {
+            cleaned_identifier = cleaned_identifier.replace(identifier.0, identifier.1);
+        }
+    }
+
     if cleaned_identifier.contains("+") {
         cleaned_identifier = cleaned_identifier.replace("+", "Plus");
     }
@@ -16,9 +51,6 @@ fn clean_identifier(raw_identifier: &str) -> String {
     }
     if cleaned_identifier.contains(".") {
         cleaned_identifier = cleaned_identifier.replace(".", "_");
-    }
-    if cleaned_identifier.contains("'") {
-        cleaned_identifier = cleaned_identifier.replace("'", "Prime");
     }
     if cleaned_identifier.contains("(") {
         cleaned_identifier = cleaned_identifier.replace("(", "_");
@@ -214,7 +246,7 @@ mod tests {
         // Start with a simple single element species.
         let sample =
             " 3 g 6/97 H   1.00    0.00    0.00    0.00    0.00 0    1.0079400     217998.828";
-        let (temperature_intervals, constituents, is_gas, mw, std_heat_of_formation) =
+        let (temperature_intervals, constituents, phase, mw, std_heat_of_formation) =
             parse_metadata(sample);
         assert_eq!(
             temperature_intervals, 3,
@@ -223,7 +255,7 @@ mod tests {
         assert_eq!(constituents.len(), 1, "Should have 1 constituent");
         let expected_constituents = vec![(1.0, "H".to_string())];
         assert_eq!(constituents, expected_constituents, "Wrong constituents",);
-        assert_eq!(is_gas, true, "is_gas should be true");
+        assert_eq!(phase, 0, "phase should be true");
         assert_eq!(mw, 1.0079400, "mw should equal expected");
         assert_eq!(
             std_heat_of_formation, 217998.828,
@@ -233,7 +265,7 @@ mod tests {
         // Try a multi element species.
         let sample =
             " 2 tpis91 C   1.00H   1.00CL  2.00BR  1.00    0.00 0  163.8286400     -45000.000";
-        let (temperature_intervals, constituents, is_gas, mw, std_heat_of_formation) =
+        let (temperature_intervals, constituents, phase, mw, std_heat_of_formation) =
             parse_metadata(sample);
         assert_eq!(
             temperature_intervals, 2,
@@ -243,11 +275,11 @@ mod tests {
         let expected_constituents = vec![
             (1.0, "C".to_string()),
             (1.0, "H".to_string()),
-            (2.0, "CL".to_string()),
-            (1.0, "BR".to_string()),
+            (2.0, "Cl".to_string()),
+            (1.0, "Br".to_string()),
         ];
         assert_eq!(constituents, expected_constituents, "Wrong constituents",);
-        assert_eq!(is_gas, true, "is_gas should be true");
+        assert_eq!(phase, 0, "phase should be true");
         assert_eq!(mw, 163.8286400, "mw should equal expected");
         assert_eq!(
             std_heat_of_formation, -45000.000,
@@ -257,16 +289,16 @@ mod tests {
         // Try a different phase.
         let sample =
             " 1 coda89 AG  1.00    0.00    0.00    0.00    0.00 1  107.8682000          0.000";
-        let (temperature_intervals, constituents, is_gas, mw, std_heat_of_formation) =
+        let (temperature_intervals, constituents, phase, mw, std_heat_of_formation) =
             parse_metadata(sample);
         assert_eq!(
             temperature_intervals, 1,
             "Temperature intervals should equal 1"
         );
         assert_eq!(constituents.len(), 1, "Should have 1 constituent");
-        let expected_constituents = vec![(1.0, "AG".to_string())];
+        let expected_constituents = vec![(1.0, "Ag".to_string())];
         assert_eq!(constituents, expected_constituents, "Wrong constituents",);
-        assert_eq!(is_gas, false, "is_gas should be false");
+        assert_eq!(phase, 1, "phase should be false");
         assert_eq!(mw, 107.8682000, "mw should equal expected");
         assert_eq!(
             std_heat_of_formation, 0.000,

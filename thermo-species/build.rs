@@ -4,10 +4,8 @@ use std::{env, fs, path::Path};
 
 #[path = "src/parsing.rs"]
 mod parsing;
-#[path = "src/types.rs"]
-mod types;
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rerun-if-changed=data/thermo.inp");
     println!("cargo::rerun-if-changed=src/parsing.rs");
@@ -33,7 +31,13 @@ fn main() {
     let mut iter = thermo_inp_cleaned.into_iter().peekable();
 
     loop {
-        if iter.peek().unwrap().split(" ").collect::<Vec<&str>>()[0] == "e-" {
+        if iter
+            .peek()
+            .ok_or("reached end of input before finding first species (\"e-\")")?
+            .split(" ")
+            .collect::<Vec<&str>>()[0]
+            == "e-"
+        {
             break;
         } else {
             iter.next(); // Throw out every line until we hit the first specimen.
@@ -42,18 +46,11 @@ fn main() {
     // types::SpeciesData
 
     let mut buffer = String::new();
-    // writeln!(&mut buffer, "#[allow(non_upper_case)]").unwrap();
+    // writeln!(&mut buffer, "#[allow(non_upper_case)]")?;
     writeln!(
         &mut buffer,
-        "pub use crate::types::{{Element, SpeciesData, AnySpeciesData}};"
-    )
-    .unwrap();
-    // Key is the identifier without '_phase' at end.
-    // Value is vec of identifiers.
-    // Example:
-    // Key: H2O
-    // Value: vec!["H2O_cr", "H2O_L",...]
-    // First capture all products/reactants.
+        "pub use crate::types::{{Element, SpeciesData, AnySpeciesData, ParseSpeciesError}};"
+    )?;
 
     let mut species: HashMap<
         String,
@@ -63,11 +60,11 @@ fn main() {
             Vec<(f64, f64, Vec<f64>)>,
         ),
     > = HashMap::new();
-    // TODO store all values in a hashmap, concating temperature data
-    // together if exact same species name, and other metadata matches
-    // Also maybe add some loud warning about when an entries temperature data
-    // is not in ascending order.
-    while iter.peek().unwrap() != "END PRODUCTS" {
+    while iter
+        .peek()
+        .ok_or("reached end of input before \"END PRODUCTS\"")?
+        != "END PRODUCTS"
+    {
         let (
             (cleaned_species_identifier, dirty_species_identifier),
             (t_intervals, constituents, phase, mw, h_formation),
@@ -145,94 +142,110 @@ fn main() {
         ),
     )>>();
     consolidated_species.sort_by(|a, b| a.0.cmp(&b.0));
-    consolidated_species.iter().for_each(
-        |(
-            cleaned_species_identifier,
-            (
-                dirty_species_identifier,
-                (_, constituents, phase, mw, h_formation),
-                cleaned_temperature_data,
-            ),
-        )| {
-            // Update condensed phase.
-            let key = if *phase == 0 {
-                // Key is just cleaned identifier.
-                cleaned_species_identifier.clone()
-            } else {
-                let idx_phase_start = cleaned_species_identifier.rfind("_").unwrap();
-                let mut identifier_no_phase = cleaned_species_identifier.clone();
-                let _ = identifier_no_phase.split_off(idx_phase_start);
-                identifier_no_phase
-            };
-            // Update condensed_phase
-            if let Some(entry) = condensed_phases.get_mut(&key) {
-                if *phase != 0 {
-                    entry.push(cleaned_species_identifier.clone());
-                }
-            } else {
-                let mut phases = vec![];
-                if *phase != 0 {
-                    phases.push(cleaned_species_identifier.clone());
-                }
-                condensed_phases.insert(key, phases);
+    for (
+        cleaned_species_identifier,
+        (
+            dirty_species_identifier,
+            (_, constituents, phase, mw, h_formation),
+            cleaned_temperature_data,
+        ),
+    ) in consolidated_species.iter()
+    {
+        // Update condensed phase.
+        let key = if *phase == 0 {
+            // Key is just cleaned identifier.
+            cleaned_species_identifier.clone()
+        } else {
+            let idx_phase_start = cleaned_species_identifier.rfind("__").expect(&format!(
+                "Failed to find phase in: {}",
+                cleaned_species_identifier
+            ));
+            let mut identifier_no_phase = cleaned_species_identifier.clone();
+            let _ = identifier_no_phase.split_off(idx_phase_start);
+            identifier_no_phase
+        };
+        // Update condensed_phase
+        if let Some(entry) = condensed_phases.get_mut(&key) {
+            if *phase != 0 {
+                entry.push(cleaned_species_identifier.clone());
             }
+        } else {
+            let mut phases = vec![];
+            if *phase != 0 {
+                phases.push(cleaned_species_identifier.clone());
+            }
+            condensed_phases.insert(key, phases);
+        }
 
-            // Add each species to the all vec.
-            all.push(cleaned_species_identifier.clone());
+        // Add each species to the all vec.
+        all.push(cleaned_species_identifier.clone());
 
-            let c = constituents.len();
-            let t = cleaned_temperature_data.len();
-            // Add beginning of static species.
-            write!(
-                &mut buffer,
-                "pub static {}: SpeciesData<{}, {}> = SpeciesData {{",
-                cleaned_species_identifier, c, t
-            )
-            .unwrap();
-            // Add symbol.
-            write!(&mut buffer, "symbol: \"{}\",", dirty_species_identifier).unwrap();
-            // Add constituents.
-            let mut constituent_str = "".to_string();
-            for (moles, element) in constituents {
-                constituent_str += &format!("({:?}, Element::{}),", moles, element);
+        let c = constituents.len();
+        let t = cleaned_temperature_data.len();
+        // Add beginning of static species.
+        write!(
+            &mut buffer,
+            "pub static {}: SpeciesData<{}, {}> = SpeciesData {{",
+            cleaned_species_identifier, c, t
+        )?;
+        // Add symbol.
+        write!(&mut buffer, "symbol: \"{}\",", dirty_species_identifier)?;
+        // Add constituents.
+        let mut constituent_str = "".to_string();
+        for (moles, element) in constituents {
+            constituent_str += &format!("({:?}, Element::{}),", moles, element);
+        }
+        write!(&mut buffer, "constituents: [{}],", constituent_str)?;
+        // Add temperature data.
+        let mut temperature_data_str = "".to_string();
+        for (low_temperature, high_temperature, coefficients) in cleaned_temperature_data {
+            let mut coefficients_str = "".to_string();
+            for coefficient in coefficients {
+                coefficients_str += &format!("{:?},", coefficient);
             }
-            write!(&mut buffer, "constituents: [{}],", constituent_str).unwrap();
-            // Add temperature data.
-            let mut temperature_data_str = "".to_string();
-            for (low_temperature, high_temperature, coefficients) in cleaned_temperature_data {
-                let mut coefficients_str = "".to_string();
-                for coefficient in coefficients {
-                    coefficients_str += &format!("{:?},", coefficient);
-                }
-                temperature_data_str += &format!(
-                    "({:?}, {:?}, [{}],),",
-                    low_temperature, high_temperature, coefficients_str
-                );
-            }
-            write!(&mut buffer, "temperature_data: [{}],", temperature_data_str).unwrap();
-            // Add mw.
-            write!(&mut buffer, "mw: {:?},", mw).unwrap();
-            // Add h_formation.
-            write!(&mut buffer, "h_formation: {:?},", h_formation).unwrap();
-            // Add phase.
-            write!(&mut buffer, "phase: {:?},", phase).unwrap();
-            // Close out struct definition.
-            writeln!(&mut buffer, "}};").unwrap();
-        },
-    );
+            temperature_data_str += &format!(
+                "({:?}, {:?}, [{}],),",
+                low_temperature, high_temperature, coefficients_str
+            );
+        }
+        write!(&mut buffer, "temperature_data: [{}],", temperature_data_str)?;
+        // Add mw.
+        write!(&mut buffer, "mw: {:?},", mw)?;
+        // Add h_formation.
+        write!(&mut buffer, "h_formation: {:?},", h_formation)?;
+        // Add phase.
+        write!(&mut buffer, "phase: {:?},", phase)?;
+        // Close out struct definition.
+        writeln!(&mut buffer, "}};")?;
+    }
 
     // Add Species enum.
-    write!(&mut buffer, "pub enum Species {{").unwrap();
+    write!(
+        &mut buffer,
+        "#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]"
+    )?;
+    write!(&mut buffer, "pub enum Species {{")?;
     for species in all.iter() {
-        write!(&mut buffer, "{},", species).unwrap();
+        write!(&mut buffer, "{},", species)?;
     }
-    writeln!(&mut buffer, "}}").unwrap();
+    writeln!(&mut buffer, "}}")?;
 
-    write!(&mut buffer, "impl Species {{").unwrap();
+    write!(&mut buffer, "pub static ALL: [Species; {}] = [", all.len())?;
+    for species in all.iter() {
+        write!(&mut buffer, "Species::{},", species)?;
+    }
+    writeln!(&mut buffer, "];")?;
+
+    // Start Species impl
+    write!(&mut buffer, "impl Species {{")?;
+
+    // Add all
+    writeln!(&mut buffer, "pub fn all() -> &'static [Species] {{&ALL}}")?;
+
     // Add phases
-    write!(&mut buffer, "pub fn phases(&self) -> &'static [Species] {{").unwrap();
-    write!(&mut buffer, "match self {{").unwrap();
-    condensed_phases.iter().for_each(|(base, phases)| {
+    write!(&mut buffer, "pub fn phases(&self) -> &'static [Species] {{")?;
+    write!(&mut buffer, "match self {{")?;
+    for (base, phases) in condensed_phases.iter() {
         let base_is_real = all.contains(base);
         let mut left = if base_is_real {
             format!("Species::{}", base)
@@ -245,46 +258,78 @@ fn main() {
             right += &format!("Species::{},", phase);
         });
         right += "],";
-        write!(&mut buffer, "{} => {}", left, right).unwrap();
-    });
+        write!(&mut buffer, "{} => {}", left, right)?;
+    }
     // Close match arm
-    write!(&mut buffer, "}}").unwrap();
+    write!(&mut buffer, "}}")?;
     // Close fn definition
-    writeln!(&mut buffer, "}}").unwrap();
+    writeln!(&mut buffer, "}}")?;
 
     // Add data
     write!(
         &mut buffer,
         "pub fn data(&self) -> &'static dyn AnySpeciesData {{"
-    )
-    .unwrap();
-    write!(&mut buffer, "match self {{").unwrap();
-    all.iter().for_each(|species| {
-        write!(&mut buffer, "Species::{} => &{},", species, species).unwrap();
-    });
+    )?;
+    write!(&mut buffer, "match self {{")?;
+    for species in all.iter() {
+        write!(&mut buffer, "Species::{} => &{},", species, species)?;
+    }
     // Close match arm
-    write!(&mut buffer, "}}").unwrap();
+    write!(&mut buffer, "}}")?;
     // Close fn definition
-    write!(&mut buffer, "}}").unwrap();
+    write!(&mut buffer, "}}")?;
 
     // Close the implementation.
-    write!(&mut buffer, "}}").unwrap();
+    writeln!(&mut buffer, "}}")?;
 
-    let out_dir = env::var_os("OUT_DIR").unwrap();
+    // Implement from_str for Species.
+    writeln!(&mut buffer, "impl std::str::FromStr for Species {{")?;
+    writeln!(&mut buffer, "type Err = ParseSpeciesError;")?;
+    writeln!(
+        &mut buffer,
+        "fn from_str(s: &str) -> Result<Self, Self::Err> {{"
+    )?;
+    write!(&mut buffer, "match s {{")?;
+    for (cleaned_species_identifier, (dirty_species_identifier, (_, _, _, _, _), _)) in
+        consolidated_species.iter()
+    {
+        write!(
+            &mut buffer,
+            "\"{}\" => Ok(Species::{}),",
+            dirty_species_identifier, cleaned_species_identifier
+        )?;
+    }
+    write!(&mut buffer, "_ => Err(ParseSpeciesError), }}",)?;
+
+    // Close functin definition.
+    writeln!(&mut buffer, "}}")?;
+
+    // Close the implementation
+    writeln!(&mut buffer, "}}")?;
+
+    // Define species!() macro.
+    writeln!(&mut buffer, "#[macro_export]")?;
+    writeln!(&mut buffer, "macro_rules! species {{")?;
+    for (cleaned_species_identifier, (dirty_species_identifier, (_, _, _, _, _), _)) in
+        consolidated_species.iter()
+    {
+        write!(
+            &mut buffer,
+            "(\"{}\") => {{ $crate::Species::{}}};",
+            dirty_species_identifier, cleaned_species_identifier
+        )?;
+    }
+    write!(
+        &mut buffer,
+        "($other:literal) => {{ compile_error!(concat!(\"Unkown species: \", $other))}}",
+    )?;
+    // Close the macro
+    writeln!(&mut buffer, "}}")?;
+
+    let out_dir =
+        env::var_os("OUT_DIR").ok_or("OUT_DIR not set — build scripts must be run via cargo")?;
     let dest_path = Path::new(&out_dir).join("thermo.rs");
-    fs::write(&dest_path, buffer).unwrap();
+    fs::write(&dest_path, buffer)?;
 
-    // use write! and writeln! macros for building string.
-    // format parsed floats using {:?} to keep precision.
+    Ok(())
 }
-
-// TODO need to setup grouping, where we enforce that when I strip the _phase at the end of the
-// identifier, all matching species get grouped together.
-
-// TODO build Species enum.
-// TODO All const array of Species enum. Note all speces data is in the binary, but only copied once!
-// impl Species {
-// pub fn data(&self) -> &'static SpeciesData {
-// match self => statics NOT a copy
-// }
-// }

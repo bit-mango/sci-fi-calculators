@@ -1,3 +1,8 @@
+use crate::Species;
+use std::fmt;
+
+const R: f64 = 8.314; // Ideal Gas Constant [J/mol•K]
+
 #[rustfmt::skip] // So it doesn't convert the single line periods into multi-line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Element {
@@ -19,13 +24,25 @@ pub enum Element {
     Rb, Sr, Y, Zr, Nb, Mo, Tc, Ru, Rh, Pd, Ag, Cd, In, Sn, Sb, Te, I, Xe,
 
     // Period 6
-    Cs, Ba, La, Ce, Pr, Nd, Pm, Sm, Eu, Gd, Tb, Dy, Ho, Er, Tm, Yb, Lu,
-    Hf, Ta, W, Re, Os, Ir, Pt, Au, Hg, Tl, Pb, Bi, Po, At, Rn,
+    Cs, Ba, La, Ce, Pr, Nd, Pm, Sm, Eu, Gd, Tb, Dy, Ho, Er, Tm, Yb, Lu, Hf, Ta, W, Re, Os, Ir, Pt, Au, Hg, Tl, Pb, Bi, Po, At, Rn,
 
     // Period 7
-    Fr, Ra, Ac, Th, Pa, U, Np, Pu, Am, Cm, Bk, Cf, Es, FmA, Md, No, Lr,
-    Rf, Db, Sg, Bh, Hs, Mt, Ds, Rg, Cn, Nh, Fl, Mc, Lv, Ts, Og,
+    Fr, Ra, Ac, Th, Pa, U, Np, Pu, Am, Cm, Bk, Cf, Es, FmA, Md, No, Lr, Rf, Db, Sg, Bh, Hs, Mt, Ds, Rg, Cn, Nh, Fl, Mc, Lv, Ts, Og,
 }
+
+impl fmt::Display for Species {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let d = self.data();
+        writeln!(f, "{} (phase {})", d.symbol(), d.phase())?;
+        writeln!(f, "  mw: {} g/mol, ΔHf: {} J/mol", d.mw(), d.h_formation())?;
+        writeln!(f, "  constituents: {:?}", d.constituents())?;
+        writeln!(f, "  temperature ranges: {:?}", d.temperature_data())?;
+        write!(f, "  sibling phases: {:?}", self.phases())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ParseSpeciesError;
 
 #[derive(Debug)]
 pub struct SpeciesData<const C: usize, const T: usize> {
@@ -37,6 +54,29 @@ pub struct SpeciesData<const C: usize, const T: usize> {
     pub phase: u8,
 }
 
+fn find_coefficients(ranges: &[(f64, f64, [f64; 9])], temperature_k: f64) -> &(f64, f64, [f64; 9]) {
+    // Check if temperature_k is greater than the maximum range we have.
+    if let Some(last) = ranges.last()
+        && temperature_k >= last.1
+    {
+        return last;
+    }
+    // Check if temperature_k is less than the minimum range we have.
+    if let Some(first) = ranges.first()
+        && temperature_k <= first.0
+    {
+        return first;
+    }
+    // Falls within a range we have.
+    for coeff in ranges.iter() {
+        if temperature_k >= coeff.0 && temperature_k <= coeff.1 {
+            return coeff;
+        }
+    }
+
+    panic!("Not sure how we got here");
+}
+
 pub trait AnySpeciesData {
     fn symbol(&self) -> &str;
     fn constituents(&self) -> &[(f64, Element)];
@@ -44,6 +84,58 @@ pub trait AnySpeciesData {
     fn mw(&self) -> f64;
     fn h_formation(&self) -> f64;
     fn phase(&self) -> u8;
+    fn cp(&self, temperature_k: f64) -> f64 {
+        let coeff = find_coefficients(self.temperature_data(), temperature_k);
+        let t_1 = temperature_k;
+        let t_2 = t_1 * t_1;
+        let t_3 = t_2 * t_1;
+        let t_4 = t_2 * t_2;
+
+        let res = coeff.2[0] / t_2
+            + coeff.2[1] / t_1
+            + coeff.2[2]
+            + coeff.2[3] * t_1
+            + coeff.2[4] * t_2
+            + coeff.2[5] * t_3
+            + coeff.2[6] * t_4;
+
+        res * R
+    }
+    fn h(&self, temperature_k: f64) -> f64 {
+        let coeff = find_coefficients(self.temperature_data(), temperature_k);
+        let t_1 = temperature_k;
+        let t_2 = t_1 * t_1;
+        let t_3 = t_2 * t_1;
+        let t_4 = t_2 * t_2;
+
+        let res = -coeff.2[0] / t_2
+            + coeff.2[1] * t_1.ln() / t_1
+            + coeff.2[2]
+            + coeff.2[3] * t_1 / 2.0
+            + coeff.2[4] * t_2 / 3.0
+            + coeff.2[5] * t_3 / 4.0
+            + coeff.2[6] * t_4 / 5.0
+            + coeff.2[7] / t_1;
+
+        res * R * t_1
+    }
+    fn s(&self, temperature_k: f64) -> f64 {
+        let coeff = find_coefficients(self.temperature_data(), temperature_k);
+        let t_1 = temperature_k;
+        let t_2 = t_1 * t_1;
+        let t_3 = t_2 * t_1;
+        let t_4 = t_2 * t_2;
+
+        let res = -coeff.2[0] / (2.0 * t_2) - coeff.2[1] / t_1
+            + coeff.2[2] * t_1.ln()
+            + coeff.2[3] * t_1
+            + coeff.2[4] * t_2 / 2.0
+            + coeff.2[5] * t_3 / 3.0
+            + coeff.2[6] * t_4 / 4.0
+            + coeff.2[8];
+
+        res * R
+    }
 }
 
 impl<const C: usize, const T: usize> AnySpeciesData for SpeciesData<C, T> {
