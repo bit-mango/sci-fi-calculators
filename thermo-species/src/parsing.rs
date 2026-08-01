@@ -31,24 +31,12 @@ fn clean_identifier(raw_identifier: &str, phase: u8) -> String {
         }
     }
 
-    if cleaned_identifier.contains("+") {
-        cleaned_identifier = cleaned_identifier.replace("+", "Plus");
-    }
-    if cleaned_identifier.contains("-") {
-        cleaned_identifier = cleaned_identifier.replace("-", "Neg");
-    }
-    if cleaned_identifier.contains(",") {
-        cleaned_identifier = cleaned_identifier.replace(",", "_");
-    }
-    if cleaned_identifier.contains(".") {
-        cleaned_identifier = cleaned_identifier.replace(".", "_");
-    }
-    if cleaned_identifier.contains("(") {
-        cleaned_identifier = cleaned_identifier.replace("(", "_");
-    }
-    if cleaned_identifier.contains(")") {
-        cleaned_identifier = cleaned_identifier.replace(")", "_");
-    }
+    // Clean characters that can not be in variable names.
+    cleaned_identifier = cleaned_identifier
+        .replace('+', "Plus")
+        .replace('-', "Neg")
+        .replace([',', '.', '(', ')'], "_");
+
     // Remove trailing '_' if present.
     if cleaned_identifier.ends_with("_") {
         let mut identifier = cleaned_identifier.chars();

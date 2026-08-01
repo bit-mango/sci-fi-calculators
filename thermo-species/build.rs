@@ -248,7 +248,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Add Species enum.
-    write!(
+    writeln!(
         &mut buffer,
         "#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]"
     )?;
