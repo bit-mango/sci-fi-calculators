@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write;
 use std::{env, fs, path::Path};
 
@@ -43,10 +43,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut buffer = String::new();
     writeln!(
         &mut buffer,
-        "pub use crate::types::{{Element, SpeciesData, AnySpeciesData, ParseSpeciesError}};"
+        "pub use crate::types::{{SpeciesData, AnySpeciesData, ParseSpeciesError}};"
     )?;
     let mut species: HashMap<String, (String, parsing::Metadata, parsing::TemperatureData)> =
         HashMap::new();
+    let mut constituents_set: BTreeSet<String> = BTreeSet::new();
     while iter
         .peek()
         .ok_or("reached end of input before \"END PRODUCTS\"")?
@@ -58,18 +59,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cleaned_temperature_data,
         ) = parsing::process_entry(&mut iter);
 
-        if cleaned_species_identifier.starts_with("Inert") {
-            continue;
+        // Save constituents.
+        for (_, constituent) in constituents.iter() {
+            constituents_set.insert(constituent.clone());
+        }
+
+        let mut invalid_temperature_range = false;
+        for (t_low, t_high, _) in cleaned_temperature_data.iter() {
+            if t_low >= t_high {
+                println!(
+                    "cargo::warning=Skipping {} — invalid temperature range: low={:.3} high={:.3}",
+                    dirty_species_identifier, t_low, t_high
+                );
+                invalid_temperature_range = true;
+                break;
+            }
+        }
+        if invalid_temperature_range {
+            continue; // skip this species entirely, move to the next entry in the outer while loop
         }
 
         // Consolidate species.
-        if let Some(entry) = species.get_mut(&cleaned_species_identifier) {
+        if let Some(entry) = species.get_mut(&dirty_species_identifier) {
             // Exact species already exists, check they are the same, and append temperature data together.
-            if entry.0 != dirty_species_identifier
-                || entry.1.3 != mw
-                || entry.1.4 != h_formation
-                || entry.1.1 != constituents
-            {
+            if entry.1.3 != mw || entry.1.4 != h_formation || entry.1.1 != constituents {
                 panic!("Species have the exact same name, but different data!");
             }
             let current_temperature_data = entry.2.clone();
@@ -111,9 +124,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             entry.2 = combined_temperature_data;
         } else {
             species.insert(
-                cleaned_species_identifier,
+                dirty_species_identifier,
                 (
-                    dirty_species_identifier,
+                    cleaned_species_identifier,
                     (t_intervals, constituents, phase, mw, h_formation),
                     cleaned_temperature_data,
                 ),
@@ -121,17 +134,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Add Constituent enum.
+    writeln!(
+        &mut buffer,
+        "#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]"
+    )?;
+    write!(&mut buffer, "pub enum Constituent {{")?;
+    for constituent in constituents_set.iter() {
+        write!(&mut buffer, "{},", constituent)?;
+    }
+    writeln!(&mut buffer, "}}")?;
+
     let mut all = vec![];
     let mut condensed_phases: HashMap<String, Vec<String>> = HashMap::new();
 
-    let mut consolidated_species = species.drain().collect::<Vec<(
-        String,
-        (
+    let mut consolidated_species = species
+        .drain()
+        .map(
+            // Swap the dirty and clean identifiers
+            |(
+                dirty_species_identifier,
+                (cleaned_species_identifier, metadata, temperature_data),
+            )| {
+                (
+                    cleaned_species_identifier,
+                    (dirty_species_identifier, metadata, temperature_data),
+                )
+            },
+        )
+        .collect::<Vec<(
             String,
-            (usize, Vec<(f64, String)>, u8, f64, f64),
-            Vec<(f64, f64, Vec<f64>)>,
-        ),
-    )>>();
+            (
+                String,
+                (usize, Vec<(f64, String)>, u8, f64, f64),
+                Vec<(f64, f64, Vec<f64>)>,
+            ),
+        )>>();
     consolidated_species.sort_by(|a, b| a.0.cmp(&b.0));
     for (
         cleaned_species_identifier,
@@ -182,8 +220,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         write!(&mut buffer, "symbol: \"{}\",", dirty_species_identifier)?;
         // Add constituents.
         let mut constituent_str = "".to_string();
-        for (moles, element) in constituents {
-            constituent_str += &format!("({:?}, Element::{}),", moles, element);
+        for (moles, constituent) in constituents {
+            constituent_str += &format!("({:?}, Constituent::{}),", moles, constituent);
         }
         write!(&mut buffer, "constituents: [{}],", constituent_str)?;
         // Add temperature data.

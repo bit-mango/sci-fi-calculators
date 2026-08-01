@@ -1,42 +1,33 @@
 #![allow(dead_code)]
 
-static PHASE_IDENTIFIERS: [(&str, &str); 24] = [
-    ("(a)", "__a"),
-    ("(an)", "__an"),
-    ("(a')", "__aPrime"),
-    ("(b)", "__b"),
-    ("(c)", "__c"),
-    ("(d)", "__d"),
-    ("(g)", "__g"),
-    ("(gr)", "__gr"),
-    ("(L)", "__L"),
-    ("(cr)", "__cr"),
-    ("(crI)", "__crI"),
-    ("(crII)", "__crII"),
-    ("(I)", "__I"),
-    ("(I')", "__IPrime"),
-    ("(II)", "__II"),
-    ("(III)", "__III"),
-    ("(III,II)", "__III_II"),
-    ("(IV)", "__IV"),
-    ("(V)", "__V"),
-    ("(II-r)", "__IINegr"),
-    ("(I-y)", "__INegy"),
-    ("(a-qz)", "__aNegqz"),
-    ("(b-crt)", "__bNegcrt"),
-    ("(b-qz)", "__bNegqz"),
-];
-fn clean_identifier(raw_identifier: &str) -> String {
+fn clean_identifier(raw_identifier: &str, phase: u8) -> String {
     let mut cleaned_identifier = raw_identifier.to_string();
     // Special naming for electrons.
     if cleaned_identifier == "e-" {
         cleaned_identifier = "E".to_string();
     }
 
-    // Check for phase.
-    for identifier in PHASE_IDENTIFIERS {
-        if cleaned_identifier.contains(identifier.0) {
-            cleaned_identifier = cleaned_identifier.replace(identifier.0, identifier.1);
+    if phase != 0 {
+        // Need to clean it.
+        if cleaned_identifier.ends_with(")") {
+            let mut identifier = cleaned_identifier.chars();
+            identifier.next_back(); // Remove trailing ')'.
+            // Remove chars until we remove the '('.
+            loop {
+                if let Some(n) = identifier.next_back()
+                    && n.to_string() == "("
+                {
+                    // We have removed the associated '(' so break.
+                    break;
+                }
+            }
+            cleaned_identifier = identifier.as_str().to_string();
+            cleaned_identifier += &format!("__{}", phase);
+        } else {
+            panic!(
+                "Species({}) with non-zero phase({}), with no trailing (PHASE_IDENTIFIER)",
+                raw_identifier, phase
+            );
         }
     }
 
@@ -81,12 +72,13 @@ pub fn process_entry(
 ) -> ((String, String), Metadata, TemperatureData) {
     // Get entry header.
     let header = iter.next().unwrap();
-    let species_identifier = header.split(" ").collect::<Vec<&str>>()[0];
-    let cleaned_species_identifier = clean_identifier(species_identifier);
-
     // Get entry metadata.
     let metadata = iter.next().unwrap();
     let cleaned_metadata = parse_metadata(&metadata);
+
+    // Process header now that we know the phase.
+    let species_identifier = header.split(" ").collect::<Vec<&str>>()[0];
+    let cleaned_species_identifier = clean_identifier(species_identifier, cleaned_metadata.2);
 
     // Get temperature data.
     let cleaned_temperature_data = (0..cleaned_metadata.0)
@@ -207,16 +199,7 @@ fn parse_metadata(raw_metadata: &str) -> (usize, Vec<(f64, String)>, u8, f64, f6
             .trim()
             .parse::<f64>()
             .unwrap_or_else(|_| panic!("Failed to parse moles from constituent: {}", constituent));
-        let element = if name.len() >= 2 {
-            // Make sure the second letter is lower case.
-            name.chars()
-                .enumerate()
-                .map(|(i, c)| if i == 1 { c.to_ascii_lowercase() } else { c })
-                .collect::<String>()
-        } else {
-            name
-        };
-        constituents.push((moles, element));
+        constituents.push((moles, name));
     }
 
     let phase = raw_metadata[50..52]
