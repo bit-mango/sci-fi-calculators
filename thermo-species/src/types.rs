@@ -57,6 +57,7 @@ pub trait AnySpeciesData {
     fn symbol(&self) -> &str;
     fn constituents(&self) -> &[(f64, Constituent)];
     fn temperature_data(&self) -> &[(f64, f64, [f64; 9])];
+    fn valid_temperature_range(&self) -> (f64, f64);
     fn mw(&self) -> f64;
     fn h_formation(&self) -> f64;
     fn phase(&self) -> u8;
@@ -123,6 +124,11 @@ impl<const C: usize, const T: usize> AnySpeciesData for SpeciesData<C, T> {
     }
     fn temperature_data(&self) -> &[(f64, f64, [f64; 9])] {
         &self.temperature_data
+    }
+    fn valid_temperature_range(&self) -> (f64, f64) {
+        let first = self.temperature_data.first().unwrap();
+        let last = self.temperature_data.last().unwrap();
+        (first.0, last.1)
     }
     fn mw(&self) -> f64 {
         self.mw

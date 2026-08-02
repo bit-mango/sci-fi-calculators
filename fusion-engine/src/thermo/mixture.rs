@@ -345,9 +345,25 @@ impl Mixture {
         mu_not: &Vec<f64>,
     ) -> Option<Vec<(f64, Species)>> {
         let mut active_condensed_species: Vec<Species> = vec![];
+        let mut rejected_condensed_species: Vec<Species> = vec![];
         let mut n_c: Vec<f64> = vec![]; // Linear moles for condensed phases
         let mut iterations = 0;
+        let mut outer_iterations = 0;
         'outer: loop {
+            outer_iterations += 1;
+            println!(
+                "[debug] outer_iterations={} active_condensed={:?} n_c={:?}",
+                outer_iterations,
+                active_condensed_species
+                    .iter()
+                    .map(|s| s.data().symbol())
+                    .collect::<Vec<_>>(),
+                n_c
+            );
+            if outer_iterations > 50 {
+                println!("[debug] bailing after 50 outer iterations");
+                break 'outer None;
+            }
             // Initialize
             let mut enn: f64 = 0.1;
             let mut ln_n = enn.ln();
@@ -433,22 +449,6 @@ impl Mixture {
 
                 let mut dn_cond: Vec<f64> = ((m + 1)..matrix_size).map(|i| x[i]).collect();
 
-                // Phase removal check.
-                let mut phase_removed = false;
-                for (idx, cond_species) in active_condensed_species.iter().enumerate() {
-                    // If the solver wants to remove more moles than what exists, it is gone.
-                    if n_c[idx] + dn_cond[idx] <= 0.0 {
-                        active_condensed_species.remove(idx);
-                        n_c.remove(idx);
-                        phase_removed = true;
-                        break; // Break for loop, array was altered.
-                    }
-                }
-                if phase_removed {
-                    iterations = 0;
-                    continue 'newton; // Matric size changed, so restart loop.
-                }
-
                 let mut ambda: f64 = 1.0;
                 let mut threshold = 5.0 * dln_n.abs();
 
@@ -479,6 +479,16 @@ impl Mixture {
                         }
                     }
                 }
+
+                // Step-size control for condensed species: don't let ambda push any
+                // active condensed species' moles below zero in a single step.
+                for idx in 0..c {
+                    if dn_cond[idx] < 0.0 {
+                        let candidate = -n_c[idx] / dn_cond[idx];
+                        ambda = ambda.min(candidate * 0.99);
+                    }
+                }
+
                 if threshold > 2.0 {
                     ambda = ambda.min(2.0 / threshold);
                 }
@@ -488,6 +498,36 @@ impl Mixture {
                 enn = ln_n.exp();
                 for idx in 0..c {
                     n_c[idx] += ambda * dn_cond[idx];
+                }
+                if c > 0 {
+                    println!(
+                        "[debug]   newton_iter={} ambda={:.4e} dn_cond={:?} n_c={:?}",
+                        iterations, ambda, dn_cond, n_c
+                    );
+                }
+
+                // Phase removal check, now checking the post-damping amount, so a
+                // species is only removed once it's actually converged to ~0, not
+                // because a single raw Newton step overshot past zero.
+                let mut phase_removed = false;
+                for idx in 0..c {
+                    if n_c[idx] < 1.0e-8 {
+                        println!(
+                            "[debug] removing {} at newton_iter={} n_c={:.4e}",
+                            active_condensed_species[idx].data().symbol(),
+                            iterations,
+                            n_c[idx]
+                        );
+                        let rejected = active_condensed_species.remove(idx);
+                        rejected_condensed_species.push(rejected);
+                        n_c.remove(idx);
+                        phase_removed = true;
+                        break;
+                    }
+                }
+                if phase_removed {
+                    iterations = 0;
+                    continue 'newton;
                 }
 
                 let mut max_gas_update: f64 = 0.0;
@@ -503,6 +543,14 @@ impl Mixture {
                 if max_gas_update < 1.0e-5 && (ambda * dln_n).abs() < 1.0e-5 {
                     break 'newton;
                 }
+                if c > 0 && iterations > 4990 {
+                    println!(
+                        "[debug]   near-cap iter={} max_gas_update={:.6e} ambda*dln_n={:.6e}",
+                        iterations,
+                        max_gas_update,
+                        (ambda * dln_n).abs()
+                    );
+                }
 
                 if iterations == 5_000 {
                     break 'outer None;
@@ -513,6 +561,18 @@ impl Mixture {
             let mut max_supersaturation = 0.0;
             for candidate in condensed_species_pool.iter() {
                 if active_condensed_species.contains(candidate) {
+                    // Skip candidates that are already active.
+                    continue;
+                }
+                if rejected_condensed_species.contains(candidate) {
+                    // Skip candidates that were already rejected.
+                    continue;
+                }
+                let valid_temperature_range = candidate.data().valid_temperature_range();
+                if temperature_k < valid_temperature_range.0
+                    || temperature_k > valid_temperature_range.1
+                {
+                    // Skip candidate if outside its valid temperature range.
                     continue;
                 }
                 let constituents = candidate.data().constituents();
@@ -530,12 +590,27 @@ impl Mixture {
                     - temperature_k * candidate.data().s(temperature_k);
                 let mu_c_rt = mu_not_cond / (R * temperature_k);
                 let supersaturation = sum_a_pi - mu_c_rt;
+                if supersaturation > 0.0 {
+                    println!(
+                        "[debug] candidate={} mu_c_rt={:.3e} sum_a_pi={:.3e} supersaturation={:.3e}",
+                        candidate.data().symbol(),
+                        mu_c_rt,
+                        sum_a_pi,
+                        supersaturation
+                    );
+                }
                 if supersaturation > max_supersaturation {
                     max_supersaturation = supersaturation;
                     most_eager_species = Some(*candidate);
                 }
             }
             if let Some(species) = most_eager_species {
+                println!(
+                    "[debug] inserting {} (T={:.1}K) supersaturation={:.3e}",
+                    species.data().symbol(),
+                    temperature_k,
+                    max_supersaturation
+                );
                 active_condensed_species.push(species);
                 n_c.push(0.001);
                 iterations = 0;
@@ -647,6 +722,17 @@ mod tests {
                     &mu_not,
                 );
                 pass_fail[i][j] = result.is_some();
+                if result.is_none() {
+                    println!(
+                        "[debug] FAILED reactants={:?} T={:.1} P={:.1}",
+                        species
+                            .iter()
+                            .map(|(n, s)| format!("{:.1}*{}", n, s.data().symbol()))
+                            .collect::<Vec<_>>(),
+                        temperature_k,
+                        pressure_bar
+                    );
+                }
             }
         }
         println!("========== Summary ==========");
