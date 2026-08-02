@@ -2,8 +2,9 @@ use crate::constants::*;
 use crate::nozzle::area_ratio::exit_pressure_from_area_ratio;
 use crate::thermo::fluid_properties::ThermoReference;
 use std::f64::consts::PI;
+use thermo_species::{AnySpeciesData, Constituent, Species, species};
 
-use crate::thermo::{mixture::Mixture, species::Species};
+use crate::thermo::mixture::Mixture;
 
 fn required_max_channel_area(
     n_dot_reaction: f64,
@@ -189,12 +190,7 @@ fn calculate_engine_output(
     // Nozzle expansion. full equilibrium flow for upper bound Isp.
     let exit_temperature = chamber_plasma_state.temperature_k
         * (exit_pressure / chamber_pressure).powf((mixture_gamma - 1.0) / mixture_gamma);
-    let plasma_species = Mixture::new(
-        tr,
-        &plasma_species.products,
-        exit_temperature,
-        exit_pressure,
-    );
+    let plasma_species = Mixture::new(&plasma_species.products, exit_temperature, exit_pressure);
     let plasma_species_low = Mixture::new_with_frozen_reactants(
         tr,
         &chamber_plasma_state.products,
@@ -251,12 +247,7 @@ fn calculate_engine_output(
     let exit_temperature = chamber_diluent_state.temperature_k
         * (exit_pressure / chamber_pressure).powf((mixture_gamma - 1.0) / mixture_gamma);
     let diluent_species = diluent_species.mix(tr, diluent);
-    let diluent_species = Mixture::new(
-        tr,
-        &diluent_species.products,
-        exit_temperature,
-        exit_pressure,
-    );
+    let diluent_species = Mixture::new(&diluent_species.products, exit_temperature, exit_pressure);
     let diluent_species_low = Mixture::new_with_frozen_reactants(
         tr,
         &chamber_diluent_state.products,
@@ -413,13 +404,12 @@ pub fn sweep_engine() {
 
     // Methane clathrate is CH4•5.75H2O
     let cations = Mixture::new(
-        &tr,
         &vec![(1.0, Species::CH4), (1.0, Species::HPlus)], // Stand in for CH5+ which there is no CEA data for.
         373.0,
         chamber_pressure,
     );
-    let anions = Mixture::new(&tr, &vec![(1.0, Species::OHNeg)], 300.0, chamber_pressure);
-    let diluent = Mixture::new(&tr, &vec![(38.00, Species::H2O)], 1_000.0, chamber_pressure);
+    let anions = Mixture::new(&vec![(1.0, Species::OHNeg)], 300.0, chamber_pressure);
+    let diluent = Mixture::new(&vec![(38.00, Species::H2O)], 1_000.0, chamber_pressure);
     // TODO seems like raising chamber pressure, increases temperature, which lets
     // me lower theta, which converses more axial velocity!
     let collision_theta_deg = 13.5;
@@ -444,7 +434,7 @@ pub fn sweep_engine() {
         fixed_total_throat_area,
     );
 
-    let diluent = Mixture::new(&tr, &vec![(1.0, Species::H2O)], 1_000.0, chamber_pressure);
+    let diluent = Mixture::new(&vec![(1.0, Species::H2O)], 1_000.0, chamber_pressure);
 
     let collision_theta_deg = 10.0;
     let coupling_efficiency = 0.0025; // Lower because the length of actual plasma in the chamber is less
