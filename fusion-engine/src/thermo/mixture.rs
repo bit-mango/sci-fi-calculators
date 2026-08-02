@@ -370,6 +370,7 @@ impl Mixture {
             let mut enln = vec![(enn / gas_species_pool.len() as f64).ln(); gas_species_pool.len()];
             let m = n_lm.len();
             let mut converged_pi: Vec<f64> = vec![0.0; m];
+            let mut trace_damped: Vec<bool> = vec![false; gas_species_pool.len()];
             'newton: loop {
                 iterations += 1;
 
@@ -454,14 +455,20 @@ impl Mixture {
 
                 // -9.21 corresponds to a mole fraction of ~1e-4.
                 const TRACE_LN_THRESHOLD: f64 = -9.21;
+                const TRACE_LN_THRESHOLD_MARGIN: f64 = 1.0; // hysteresis band
                 const FLOOR_LN_THRESHOLD: f64 = -40.0;
 
                 // Step-size control for trace species.
                 for j in 0..gas_species_pool.len() {
                     if deln_gas[j] > 0.0 {
-                        // Check if species is currently trace.
-                        // Enln[j] far below Ennl -> enln[j] < ln_n + TRACE_LN_THRESHOLD
-                        if enln[j] < ln_n + TRACE_LN_THRESHOLD {
+                        let should_damp = if trace_damped[j] {
+                            enln[j] < ln_n + TRACE_LN_THRESHOLD + TRACE_LN_THRESHOLD_MARGIN
+                        } else {
+                            enln[j] < ln_n + TRACE_LN_THRESHOLD
+                        };
+                        trace_damped[j] = should_damp;
+
+                        if should_damp {
                             let gap = (deln_gas[j] - dln_n).abs();
                             if gap > 1.0e-8 {
                                 let candidate = (TRACE_LN_THRESHOLD - enln[j] + ln_n).abs() / gap;
@@ -471,6 +478,7 @@ impl Mixture {
                             threshold = deln_gas[j];
                         }
                     } else if deln_gas[j] < 0.0 {
+                        trace_damped[j] = false;
                         // Species is shrinking. If it's already far below the floor,
                         // stop letting Newton push it any further down. Clamp the
                         // per species step instead of touching the global ambda.
