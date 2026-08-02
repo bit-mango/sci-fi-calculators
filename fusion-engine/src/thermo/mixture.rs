@@ -346,11 +346,14 @@ impl Mixture {
     ) -> Option<Vec<(f64, Species)>> {
         // -9.21 corresponds to a mole fraction of ~1e-4.
         const TRACE_LN_THRESHOLD: f64 = -9.21;
-        const TRACE_LN_THRESHOLD_MARGIN: f64 = 1.0; // hysteresis band
         const FLOOR_LN_THRESHOLD: f64 = -40.0;
+        let mut active_gas: Vec<bool> = vec![true; gas_species_pool.len()];
+        let mut excluded_gas_n: Vec<f64> = vec![0.0; gas_species_pool.len()];
+        let mut rejected_gas: Vec<bool> = vec![false; gas_species_pool.len()];
         let mut active_condensed_species: Vec<Species> = vec![];
         let mut rejected_condensed_species: Vec<Species> = vec![];
         let mut ion_solving_disabled = false;
+        let mut gas_total_pinned = false;
         let e_idx = n_lm.iter().position(|(_, c)| *c == Constituent::E);
         let mut n_c: Vec<f64> = vec![]; // Linear moles for condensed phases
         let mut iterations = 0;
@@ -376,7 +379,6 @@ impl Mixture {
             let mut enln = vec![(enn / gas_species_pool.len() as f64).ln(); gas_species_pool.len()];
             let m = n_lm.len();
             let mut converged_pi: Vec<f64> = vec![0.0; m];
-            let mut trace_damped: Vec<bool> = vec![false; gas_species_pool.len()];
             'newton: loop {
                 iterations += 1;
 
@@ -392,28 +394,53 @@ impl Mixture {
                 let mu: Vec<f64> = (0..gas_species_pool.len())
                     .map(|j| mu_not[j] / (R * temperature_k) + enln[j] + tm)
                     .collect();
-                let sumn: f64 = en.iter().sum();
+                let sumn: f64 = (0..gas_species_pool.len())
+                    .filter(|&j| active_gas[j])
+                    .map(|j| en[j])
+                    .sum();
 
                 (0..m).for_each(|i| {
                     (0..m).for_each(|k| {
                         g[(i, k)] = (0..gas_species_pool.len())
+                            .filter(|&j| active_gas[j])
                             .map(|j| a[i][j] * a[k][j] * en[j])
                             .sum::<f64>();
                     });
-                    let sum = (0..gas_species_pool.len()).map(|j| a[i][j] * en[j]).sum();
+                    let sum = (0..active_gas.len())
+                        .filter(|&j| active_gas[j])
+                        .map(|j| a[i][j] * en[j])
+                        .sum();
                     g[(i, m)] = sum;
                     g[(m, i)] = sum;
                 });
                 g[(m, m)] = sumn - enn;
+                if c > 0 {
+                    println!(
+                        "[debug]   gmm iter={} sumn={:.6e} enn={:.6e} g_mm={:.6e}",
+                        iterations,
+                        sumn,
+                        enn,
+                        g[(m, m)]
+                    );
+                }
 
                 (0..m).for_each(|i| {
                     let left: f64 = (0..gas_species_pool.len())
+                        .filter(|&j| active_gas[j])
                         .map(|j| a[i][j] * en[j] * mu[j])
                         .sum();
-                    let right: f64 = (0..gas_species_pool.len()).map(|j| a[i][j] * en[j]).sum();
-                    rhs[i] = left + b[i] - right;
+                    let right: f64 = (0..gas_species_pool.len())
+                        .filter(|&j| active_gas[j])
+                        .map(|j| a[i][j] * en[j])
+                        .sum();
+                    let excluded_mass: f64 = (0..gas_species_pool.len())
+                        .filter(|&j| !active_gas[j])
+                        .map(|j| a[i][j] * excluded_gas_n[j])
+                        .sum();
+                    rhs[i] = left + b[i] - right - excluded_mass
                 });
                 rhs[m] = (0..gas_species_pool.len())
+                    .filter(|&j| active_gas[j])
                     .map(|j| en[j] * mu[j])
                     .sum::<f64>()
                     + (enn - sumn);
@@ -437,6 +464,26 @@ impl Mixture {
                     let mu_not_cond = cond_species.data().h(temperature_k)
                         - temperature_k * cond_species.data().s(temperature_k);
                     rhs[row] = mu_not_cond / (R * temperature_k);
+                }
+
+                if !gas_total_pinned {
+                    const ROW_TOL: f64 = 1e-8;
+                    let m_row_is_degenerate = (0..matrix_size).all(|k| g[(m, k)].abs() < ROW_TOL);
+                    if m_row_is_degenerate {
+                        println!(
+                            "[debug] total-moles row degenerate at iter={} T={:.1}, pinning dln_n=0",
+                            iterations, temperature_k
+                        );
+                        gas_total_pinned = true;
+                    }
+                }
+                if gas_total_pinned {
+                    for k in 0..matrix_size {
+                        g[(m, k)] = 0.0;
+                        g[(k, m)] = 0.0;
+                    }
+                    g[(m, m)] = 1.0;
+                    rhs[m] = 0.0;
                 }
 
                 if ion_solving_disabled {
@@ -522,14 +569,9 @@ impl Mixture {
                 // Step-size control for trace species.
                 for j in 0..gas_species_pool.len() {
                     if deln_gas[j] > 0.0 {
-                        let should_damp = if trace_damped[j] {
-                            enln[j] < ln_n + TRACE_LN_THRESHOLD + TRACE_LN_THRESHOLD_MARGIN
-                        } else {
-                            enln[j] < ln_n + TRACE_LN_THRESHOLD
-                        };
-                        trace_damped[j] = should_damp;
+                        let is_trace = enln[j] < ln_n + TRACE_LN_THRESHOLD;
 
-                        if should_damp {
+                        if is_trace {
                             let gap = (deln_gas[j] - dln_n).abs();
                             if gap > 1.0e-8 {
                                 let candidate = (TRACE_LN_THRESHOLD - enln[j] + ln_n).abs() / gap;
@@ -540,7 +582,6 @@ impl Mixture {
                             threshold_species = Some(j);
                         }
                     } else if deln_gas[j] < 0.0 {
-                        trace_damped[j] = false;
                         // Species is shrinking. If it's already far below the floor,
                         // stop letting Newton push it any further down. Clamp the
                         // per species step instead of touching the global ambda.
@@ -570,15 +611,20 @@ impl Mixture {
                     n_c[idx] += ambda * dn_cond[idx];
                 }
                 if c > 0 {
+                    let active_summary: Vec<(&str, f64, f64)> = (0..gas_species_pool.len())
+                        .filter(|&j| active_gas[j])
+                        .map(|j| (gas_species_pool[j].data().symbol(), enln[j], deln_gas[j]))
+                        .collect();
                     println!(
-                        "[debug]   newton_iter={} ambda={:.4e} dln_n={:.6e} threshold={:.6e} threshold_species={:?} dn_cond={:?} n_c={:?}",
+                        "[debug]   newton_iter={} ambda={:.4e} dln_n={:.6e} threshold={:.6e} threshold_species={:?} dn_cond={:?} n_c={:?} active_gas={:?}",
                         iterations,
                         ambda,
                         dln_n,
                         threshold,
                         threshold_species.map(|j| gas_species_pool[j].data().symbol()),
                         dn_cond,
-                        n_c
+                        n_c,
+                        active_summary
                     );
                 }
 
@@ -608,6 +654,9 @@ impl Mixture {
 
                 let mut max_gas_update: f64 = 0.0;
                 for j in 0..gas_species_pool.len() {
+                    if !active_gas[j] {
+                        continue;
+                    }
                     let step = ambda * deln_gas[j];
                     enln[j] += step;
                     max_gas_update = max_gas_update.max(step.abs());
@@ -619,28 +668,30 @@ impl Mixture {
                 if max_gas_update < 1.0e-5 && (ambda * dln_n).abs() < 1.0e-5 {
                     break 'newton;
                 }
-                if c > 0 && iterations > 4990 {
-                    let (worst_j, worst_deln) = deln_gas
-                        .iter()
-                        .enumerate()
-                        .max_by(|(_, a), (_, b)| a.abs().partial_cmp(&b.abs()).unwrap())
-                        .map(|(j, v)| (j, *v))
-                        .unwrap();
-                    println!(
-                        "[debug]   near-cap iter={} max_gas_update={:.6e} ambda*dln_n={:.6e} worst_species={} worst_deln_gas={:.6e} enln={:.4} trace_damped={}",
-                        iterations,
-                        max_gas_update,
-                        (ambda * dln_n).abs(),
-                        gas_species_pool[worst_j].data().symbol(),
-                        worst_deln,
-                        enln[worst_j],
-                        trace_damped[worst_j]
-                    );
-                }
 
                 if iterations == 5_000 {
                     break 'outer None;
                 }
+            }
+
+            const DELETE_LN_THRESHOLD: f64 = -30.0;
+            let mut species_excluded = false;
+            for j in 0..gas_species_pool.len() {
+                if active_gas[j] && enln[j] < ln_n + DELETE_LN_THRESHOLD {
+                    println!(
+                        "[debug] excluding {} enln={:.3}",
+                        gas_species_pool[j].data().symbol(),
+                        enln[j]
+                    );
+                    active_gas[j] = false;
+                    excluded_gas_n[j] = enln[j].exp();
+                    rejected_gas[j] = true;
+                    species_excluded = true;
+                }
+            }
+            if species_excluded {
+                iterations = 0;
+                continue 'outer;
             }
             // Check all inactive condensed species to guarantee global minimum gibbs.
             let mut most_eager_species: Option<Species> = None;
@@ -702,11 +753,46 @@ impl Mixture {
                 iterations = 0;
                 continue 'outer;
             }
+            // // Check all excluded gas species to see if any should be reinstated.
+            // let mut most_eager_gas: Option<usize> = None;
+            // let mut max_gas_driving_force = 0.0;
+            // for j in 0..gas_species_pool.len() {
+            //     // Skip species if already in use or it is rejected.
+            //     if active_gas[j] || rejected_gas[j] {
+            //         continue;
+            //     }
+            //     let sum_a_pi: f64 = (0..m).map(|i| a[i][j] * converged_pi[i]).sum();
+            //     let mu_j_rt = mu_not[j] / (R * temperature_k)
+            //         + (ln_n + TRACE_LN_THRESHOLD)
+            //         + (pressure_bar / enn).ln();
+            //     let driving_force = sum_a_pi - mu_j_rt;
+            //     if driving_force > max_gas_driving_force {
+            //         max_gas_driving_force = driving_force;
+            //         most_eager_gas = Some(j);
+            //     }
+            // }
+            // if let Some(j) = most_eager_gas {
+            //     println!(
+            //         "[debug] reinstating {} driving_force={:.3e}",
+            //         gas_species_pool[j].data().symbol(),
+            //         max_gas_driving_force
+            //     );
+            //     active_gas[j] = true;
+            //     iterations = 0;
+            //     continue 'outer;
+            // }
             // Return the converged product moles
-            let result: Vec<(f64, Species)> = enln
+            let result: Vec<(f64, Species)> = gas_species_pool
                 .iter()
-                .zip(gas_species_pool.iter())
-                .map(|(log_n, species)| (log_n.exp(), species.clone()))
+                .enumerate()
+                .map(|(j, species)| {
+                    let n_j = if active_gas[j] {
+                        enln[j].exp()
+                    } else {
+                        excluded_gas_n[j]
+                    };
+                    (n_j, species.clone())
+                })
                 .collect();
             break 'outer Some(result); // Converged!
         }
