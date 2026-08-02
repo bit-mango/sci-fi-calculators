@@ -20,8 +20,9 @@ pub struct Mixture {
 
 impl Mixture {
     pub fn new(reactants: &Vec<(f64, Species)>, temperature_k: f64, pressure_bar: f64) -> Self {
-        let (species_pool, element_pool) = Mixture::reaction_pool(reactants);
-        let mu_not = species_pool
+        let (gas_species_pool, condensed_species_pool, element_pool) =
+            Mixture::reaction_pool(reactants);
+        let mu_not = gas_species_pool
             .iter()
             .map(|species| {
                 let mu_not_i = species.data().h(temperature_k)
@@ -32,7 +33,7 @@ impl Mixture {
         let a = element_pool
             .iter()
             .map(|(_, element)| {
-                species_pool
+                gas_species_pool
                     .iter()
                     .map(|species| {
                         let children = species.data().constituents();
@@ -53,7 +54,8 @@ impl Mixture {
         let result = Mixture::solve_for_products(
             temperature_k,
             pressure_bar,
-            &species_pool,
+            &gas_species_pool,
+            &condensed_species_pool,
             &element_pool,
             &a,
             &b,
@@ -273,7 +275,9 @@ impl Mixture {
         Self::new_with_frozen_reactants(tr, &scaled_products, self.temperature_k, self.pressure_bar)
     }
 
-    fn reaction_pool(products: &Vec<(f64, Species)>) -> (Vec<Species>, Vec<(f64, Constituent)>) {
+    fn reaction_pool(
+        products: &Vec<(f64, Species)>,
+    ) -> (Vec<Species>, Vec<Species>, Vec<(f64, Constituent)>) {
         let mut element_pool: HashMap<Constituent, f64> = HashMap::new();
         products.iter().for_each(|(parent_moles, parent_species)| {
             let children = parent_species.data().constituents();
@@ -289,10 +293,27 @@ impl Mixture {
         element_pool.entry(Constituent::E).or_insert(0.0);
         // Filter out any species we don't have constituent elements for,
         // and condensed phase species.
-        let species_pool = Species::all()
+        let gas_species_pool = Species::all()
             .iter()
             .filter(|species| {
                 if species.data().phase() > 0 {
+                    return false;
+                }
+                let children = species.data().constituents();
+                for child in children {
+                    if !element_pool.contains_key(&child.1) {
+                        return false;
+                    }
+                }
+                return true;
+            })
+            .map(|s| *s)
+            .collect::<Vec<Species>>();
+        let condensed_species_pool = Species::all()
+            .iter()
+            .filter(|species| {
+                // Skip gas species.
+                if species.data().phase() == 0 {
                     return false;
                 }
                 let children = species.data().constituents();
@@ -310,128 +331,223 @@ impl Mixture {
             .map(|(species, moles)| (moles, species))
             .collect::<Vec<(f64, Constituent)>>();
         element_pool.sort_by(|a, b| a.1.cmp(&b.1));
-        (species_pool, element_pool)
+        (gas_species_pool, condensed_species_pool, element_pool)
     }
 
     fn solve_for_products(
         temperature_k: f64,
         pressure_bar: f64,
-        n_g: &Vec<Species>,             // species pool
-        n_lm: &Vec<(f64, Constituent)>, // element pool
-        a: &Vec<Vec<f64>>,              // moles of element i in species j
-        b: &Vec<f64>,                   // element totals, n_lm.0
+        gas_species_pool: &Vec<Species>,       // gas species pool
+        condensed_species_pool: &Vec<Species>, // condensed species pool
+        n_lm: &Vec<(f64, Constituent)>,        // element pool
+        a: &Vec<Vec<f64>>,                     // moles of element i in species j
+        b: &Vec<f64>,                          // element totals, n_lm.0
         mu_not: &Vec<f64>,
     ) -> Option<Vec<(f64, Species)>> {
-        // Initialize
-        let mut enn: f64 = 0.1;
-        let mut ln_n = enn.ln();
-        let mut enln = vec![(enn / n_g.len() as f64).ln(); n_g.len()];
-
+        let mut active_condensed_species: Vec<Species> = vec![];
+        let mut n_c: Vec<f64> = vec![]; // Linear moles for condensed phases
         let mut iterations = 0;
-        loop {
-            let tm = (pressure_bar / enn).ln();
-            let en: Vec<f64> = enln.iter().map(|x| x.exp()).collect();
-            let mu: Vec<f64> = (0..n_g.len())
-                .map(|j| mu_not[j] / (R * temperature_k) + enln[j] + tm)
-                .collect();
-            let sumn: f64 = en.iter().sum();
-
+        'outer: loop {
+            // Initialize
+            let mut enn: f64 = 0.1;
+            let mut ln_n = enn.ln();
+            let mut enln = vec![(enn / gas_species_pool.len() as f64).ln(); gas_species_pool.len()];
             let m = n_lm.len();
+            let mut converged_pi: Vec<f64> = vec![0.0; m];
+            'newton: loop {
+                iterations += 1;
 
-            let mut g = DMatrix::zeros(m + 1, m + 1);
-            let mut rhs = DVector::zeros(m + 1);
-            (0..m).for_each(|i| {
-                (0..m).for_each(|k| {
-                    g[(i, k)] = (0..n_g.len())
-                        .map(|j| a[i][j] * a[k][j] * en[j])
-                        .sum::<f64>();
+                let c = active_condensed_species.len();
+                let matrix_size = m + 1 + c;
+
+                // Build dynamically sized G, RHS.
+                let mut g = DMatrix::zeros(matrix_size, matrix_size);
+                let mut rhs = DVector::zeros(matrix_size);
+
+                let tm = (pressure_bar / enn).ln();
+                let en: Vec<f64> = enln.iter().map(|x| x.exp()).collect();
+                let mu: Vec<f64> = (0..gas_species_pool.len())
+                    .map(|j| mu_not[j] / (R * temperature_k) + enln[j] + tm)
+                    .collect();
+                let sumn: f64 = en.iter().sum();
+
+                (0..m).for_each(|i| {
+                    (0..m).for_each(|k| {
+                        g[(i, k)] = (0..gas_species_pool.len())
+                            .map(|j| a[i][j] * a[k][j] * en[j])
+                            .sum::<f64>();
+                    });
+                    let sum = (0..gas_species_pool.len()).map(|j| a[i][j] * en[j]).sum();
+                    g[(i, m)] = sum;
+                    g[(m, i)] = sum;
                 });
-                let sum = (0..n_g.len()).map(|j| a[i][j] * en[j]).sum();
-                g[(i, m)] = sum;
-                g[(m, i)] = sum;
-            });
-            g[(m, m)] = sumn - enn;
+                g[(m, m)] = sumn - enn;
 
-            (0..m).for_each(|i| {
-                let left: f64 = (0..n_g.len()).map(|j| a[i][j] * en[j] * mu[j]).sum();
-                let right: f64 = (0..n_g.len()).map(|j| a[i][j] * en[j]).sum();
-                rhs[i] = left + b[i] - right;
-            });
-            rhs[m] = (0..n_g.len()).map(|j| en[j] * mu[j]).sum::<f64>() + (enn - sumn);
+                (0..m).for_each(|i| {
+                    let left: f64 = (0..gas_species_pool.len())
+                        .map(|j| a[i][j] * en[j] * mu[j])
+                        .sum();
+                    let right: f64 = (0..gas_species_pool.len()).map(|j| a[i][j] * en[j]).sum();
+                    rhs[i] = left + b[i] - right;
+                });
+                rhs[m] = (0..gas_species_pool.len())
+                    .map(|j| en[j] * mu[j])
+                    .sum::<f64>()
+                    + (enn - sumn);
 
-            // Solve G*X = RHS using LU decomposition.
-            let x = g.lu().solve(&rhs)?;
-
-            // Calculate Deln.
-            let dln_n = x[m];
-            let mut deln: Vec<f64> = (0..n_g.len())
-                .map(|j| {
-                    let sum_a_pi: f64 = (0..m).map(|i| a[i][j] * x[i]).sum();
-                    -mu[j] + sum_a_pi + dln_n
-                })
-                .collect();
-
-            let mut ambda: f64 = 1.0;
-            let mut threshold = 5.0 * dln_n.abs();
-
-            // -9.21 corresponds to a mole fraction of ~1e-4.
-            const TRACE_LN_THRESHOLD: f64 = -9.21;
-            const FLOOR_LN_THRESHOLD: f64 = -40.0;
-
-            // Step-size control for trace species.
-            for j in 0..n_g.len() {
-                if deln[j] > 0.0 {
-                    // Check if species is currently trace.
-                    // Enln[j] far below Ennl -> enln[j] < ln_n + TRACE_LN_THRESHOLD
-                    if enln[j] < ln_n + TRACE_LN_THRESHOLD {
-                        let gap = (deln[j] - dln_n).abs();
-                        if gap > 1.0e-8 {
-                            let candidate = (TRACE_LN_THRESHOLD - enln[j] + ln_n).abs() / gap;
-                            ambda = ambda.min(candidate);
-                        }
-                    } else if deln[j] > threshold {
-                        threshold = deln[j];
+                // Build condensed species ros/cols.
+                for (idx, cond_species) in active_condensed_species.iter().enumerate() {
+                    let row = m + 1 + idx;
+                    let constituents = cond_species.data().constituents();
+                    for i in 0..m {
+                        // Atoms of element i in condensed.
+                        let a_ic = constituents
+                            .iter()
+                            .find(|cond| cond.1 == n_lm[i].1)
+                            .map(|c| c.0)
+                            .unwrap_or(0.0);
+                        g[(row, i)] = a_ic;
+                        g[(i, row)] = a_ic;
+                        rhs[i] -= a_ic * n_c[idx];
                     }
-                } else if deln[j] < 0.0 {
-                    // Species is shrinking. If it's already far below the floor,
-                    // stop letting Newton push it any further down. Clamp the
-                    // per species step instead of touching the global ambda.
-                    if enln[j] < ln_n + FLOOR_LN_THRESHOLD {
-                        deln[j] = 0.0; // freeze this species update this iteration
+                    // RHS for condensed is mu_c_not / RT
+                    let mu_not_cond = cond_species.data().h(temperature_k)
+                        - temperature_k * cond_species.data().s(temperature_k);
+                    rhs[row] = mu_not_cond / (R * temperature_k);
+                }
+
+                // Solve G*X = RHS using LU decomposition.
+                let x = g.lu().solve(&rhs)?;
+                for i in 0..m {
+                    converged_pi[i] = x[i];
+                }
+
+                // Calculate Deln.
+                let dln_n = x[m];
+                let mut deln_gas: Vec<f64> = (0..gas_species_pool.len())
+                    .map(|j| {
+                        let sum_a_pi: f64 = (0..m).map(|i| a[i][j] * x[i]).sum();
+                        -mu[j] + sum_a_pi + dln_n
+                    })
+                    .collect();
+
+                let mut dn_cond: Vec<f64> = ((m + 1)..matrix_size).map(|i| x[i]).collect();
+
+                // Phase removal check.
+                let mut phase_removed = false;
+                for (idx, cond_species) in active_condensed_species.iter().enumerate() {
+                    // If the solver wants to remove more moles than what exists, it is gone.
+                    if n_c[idx] + dn_cond[idx] <= 0.0 {
+                        active_condensed_species.remove(idx);
+                        n_c.remove(idx);
+                        phase_removed = true;
+                        break; // Break for loop, array was altered.
                     }
                 }
-            }
-            if threshold > 2.0 {
-                ambda = ambda.min(2.0 / threshold);
-            }
+                if phase_removed {
+                    iterations = 0;
+                    continue 'newton; // Matric size changed, so restart loop.
+                }
 
-            // Update state variables using damped step.
-            ln_n += ambda * dln_n;
-            enn = ln_n.exp();
+                let mut ambda: f64 = 1.0;
+                let mut threshold = 5.0 * dln_n.abs();
 
-            let mut max_update: f64 = 0.0;
-            for j in 0..n_g.len() {
-                let step = ambda * deln[j];
-                enln[j] += step;
-                max_update = max_update.max(step.abs());
+                // -9.21 corresponds to a mole fraction of ~1e-4.
+                const TRACE_LN_THRESHOLD: f64 = -9.21;
+                const FLOOR_LN_THRESHOLD: f64 = -40.0;
+
+                // Step-size control for trace species.
+                for j in 0..gas_species_pool.len() {
+                    if deln_gas[j] > 0.0 {
+                        // Check if species is currently trace.
+                        // Enln[j] far below Ennl -> enln[j] < ln_n + TRACE_LN_THRESHOLD
+                        if enln[j] < ln_n + TRACE_LN_THRESHOLD {
+                            let gap = (deln_gas[j] - dln_n).abs();
+                            if gap > 1.0e-8 {
+                                let candidate = (TRACE_LN_THRESHOLD - enln[j] + ln_n).abs() / gap;
+                                ambda = ambda.min(candidate);
+                            }
+                        } else if deln_gas[j] > threshold {
+                            threshold = deln_gas[j];
+                        }
+                    } else if deln_gas[j] < 0.0 {
+                        // Species is shrinking. If it's already far below the floor,
+                        // stop letting Newton push it any further down. Clamp the
+                        // per species step instead of touching the global ambda.
+                        if enln[j] < ln_n + FLOOR_LN_THRESHOLD {
+                            deln_gas[j] = 0.0; // freeze this species update this iteration
+                        }
+                    }
+                }
+                if threshold > 2.0 {
+                    ambda = ambda.min(2.0 / threshold);
+                }
+
+                // Update state variables using damped step.
+                ln_n += ambda * dln_n;
+                enn = ln_n.exp();
+                for idx in 0..c {
+                    n_c[idx] += ambda * dn_cond[idx];
+                }
+
+                let mut max_gas_update: f64 = 0.0;
+                for j in 0..gas_species_pool.len() {
+                    let step = ambda * deln_gas[j];
+                    enln[j] += step;
+                    max_gas_update = max_gas_update.max(step.abs());
+                }
+
+                // TODO do I need to do this mid flight check??
+
+                // Convergence check.
+                if max_gas_update < 1.0e-5 && (ambda * dln_n).abs() < 1.0e-5 {
+                    break 'newton;
+                }
+
+                if iterations == 5_000 {
+                    break 'outer None;
+                }
             }
-
-            // Convergence check.
-            if max_update < 1.0e-5 && (ambda * dln_n).abs() < 1.0e-5 {
-                // Return the converged product moles
-                let result: Vec<(f64, Species)> = enln
-                    .iter()
-                    .zip(n_g.iter())
-                    .map(|(log_n, species)| (log_n.exp(), species.clone()))
-                    .collect();
-                break Some(result); // Converged!
+            // Check all inactive condensed species to guarantee global minimum gibbs.
+            let mut most_eager_species: Option<Species> = None;
+            let mut max_supersaturation = 0.0;
+            for candidate in condensed_species_pool.iter() {
+                if active_condensed_species.contains(candidate) {
+                    continue;
+                }
+                let constituents = candidate.data().constituents();
+                let sum_a_pi: f64 = (0..m)
+                    .map(|i| {
+                        let ac_i = constituents
+                            .iter()
+                            .find(|c| c.1 == n_lm[i].1)
+                            .map(|c| c.0)
+                            .unwrap_or(0.0);
+                        ac_i * converged_pi[i]
+                    })
+                    .sum();
+                let mu_not_cond = candidate.data().h(temperature_k)
+                    - temperature_k * candidate.data().s(temperature_k);
+                let mu_c_rt = mu_not_cond / (R * temperature_k);
+                let supersaturation = sum_a_pi - mu_c_rt;
+                if supersaturation > max_supersaturation {
+                    max_supersaturation = supersaturation;
+                    most_eager_species = Some(*candidate);
+                }
             }
-
-            iterations += 1;
-
-            if iterations == 5_000 {
-                break None;
+            if let Some(species) = most_eager_species {
+                active_condensed_species.push(species);
+                n_c.push(0.001);
+                iterations = 0;
+                continue 'outer;
             }
+            // Return the converged product moles
+            let result: Vec<(f64, Species)> = enln
+                .iter()
+                .zip(gas_species_pool.iter())
+                .map(|(log_n, species)| (log_n.exp(), species.clone()))
+                .collect();
+            break 'outer Some(result); // Converged!
         }
     }
 
@@ -490,8 +606,9 @@ mod tests {
         let mut pass_fail = vec![vec![false; reactants.len()]; conditions.len()];
         for (i, (temperature_k, pressure_bar)) in conditions.iter().enumerate() {
             for (j, species) in reactants.iter().enumerate() {
-                let (species_pool, element_pool) = Mixture::reaction_pool(&species);
-                let mu_not = species_pool
+                let (gas_species_pool, condensed_species_pool, element_pool) =
+                    Mixture::reaction_pool(&species);
+                let mu_not = gas_species_pool
                     .iter()
                     .map(|species| {
                         let mu_not_i = species.data().h(*temperature_k)
@@ -502,7 +619,7 @@ mod tests {
                 let a = element_pool
                     .iter()
                     .map(|(_, element)| {
-                        species_pool
+                        gas_species_pool
                             .iter()
                             .map(|species| {
                                 let children = species.data().constituents();
@@ -522,7 +639,8 @@ mod tests {
                 let result = Mixture::solve_for_products(
                     *temperature_k,
                     *pressure_bar,
-                    &species_pool,
+                    &gas_species_pool,
+                    &condensed_species_pool,
                     &element_pool,
                     &a,
                     &b,
