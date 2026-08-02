@@ -344,8 +344,14 @@ impl Mixture {
         b: &Vec<f64>,                          // element totals, n_lm.0
         mu_not: &Vec<f64>,
     ) -> Option<Vec<(f64, Species)>> {
+        // -9.21 corresponds to a mole fraction of ~1e-4.
+        const TRACE_LN_THRESHOLD: f64 = -9.21;
+        const TRACE_LN_THRESHOLD_MARGIN: f64 = 1.0; // hysteresis band
+        const FLOOR_LN_THRESHOLD: f64 = -40.0;
         let mut active_condensed_species: Vec<Species> = vec![];
         let mut rejected_condensed_species: Vec<Species> = vec![];
+        let mut ion_solving_disabled = false;
+        let e_idx = n_lm.iter().position(|(_, c)| *c == Constituent::E);
         let mut n_c: Vec<f64> = vec![]; // Linear moles for condensed phases
         let mut iterations = 0;
         let mut outer_iterations = 0;
@@ -433,8 +439,67 @@ impl Mixture {
                     rhs[row] = mu_not_cond / (R * temperature_k);
                 }
 
+                if ion_solving_disabled {
+                    if let Some(e_idx) = e_idx {
+                        for k in 0..matrix_size {
+                            g[(e_idx, k)] = 0.0;
+                            g[(k, e_idx)] = 0.0;
+                        }
+                        g[(e_idx, e_idx)] = 1.0;
+                        rhs[e_idx] = 0.0;
+                    }
+                }
+
                 // Solve G*X = RHS using LU decomposition.
-                let x = g.lu().solve(&rhs)?;
+                let x = match g.clone().lu().solve(&rhs) {
+                    Some(x) => x,
+                    None => {
+                        const TOL: f64 = 1e-8;
+                        let e_row_is_degenerate = e_idx.is_some_and(|e_idx| {
+                            (0..matrix_size).all(|k| g[(e_idx, k)].abs() < TOL)
+                        });
+
+                        if !ion_solving_disabled && e_row_is_degenerate {
+                            // Enable ion-row fallback adn retry this same Newton.
+                            println!(
+                                "[debug] ion fallback triggered at iter={} T={:.1}",
+                                iterations, temperature_k
+                            );
+                            ion_solving_disabled = true;
+                            if let Some(e_idx) = e_idx {
+                                for j in 0..gas_species_pool.len() {
+                                    if a[e_idx][j] != 0.0 {
+                                        enln[j] = ln_n + FLOOR_LN_THRESHOLD;
+                                    }
+                                }
+                            }
+                            iterations -= 1;
+                            continue 'newton;
+                        } else {
+                            println!(
+                                "[debug] LU fail -> SVD path at iter={} T={:.1} ion_disabled={} e_degenerate={}",
+                                iterations,
+                                temperature_k,
+                                ion_solving_disabled,
+                                e_row_is_degenerate
+                            );
+                        }
+                        // Not an E-row issue(or already tried disabling ions and it's still
+                        // singular) use SVD least-squares solve.
+                        // Singular/near-singular. Legitamte when one species dominates
+                        // the mixutre enough that it can't independently pin down every
+                        // element potential (the extra degree(s) of freedom don't change
+                        // composition, only which pi values get reported). Use the
+                        // minimum-norm least squares solution instead of failing.
+                        match g.svd(true, true).solve(&rhs, 1e-10) {
+                            Ok(x) => x,
+                            Err(e) => {
+                                println!("[debug] SVD FAILED: {}", e);
+                                return None;
+                            }
+                        }
+                    }
+                };
                 for i in 0..m {
                     converged_pi[i] = x[i];
                 }
@@ -448,15 +513,11 @@ impl Mixture {
                     })
                     .collect();
 
-                let mut dn_cond: Vec<f64> = ((m + 1)..matrix_size).map(|i| x[i]).collect();
+                let dn_cond: Vec<f64> = ((m + 1)..matrix_size).map(|i| x[i]).collect();
 
                 let mut ambda: f64 = 1.0;
                 let mut threshold = 5.0 * dln_n.abs();
-
-                // -9.21 corresponds to a mole fraction of ~1e-4.
-                const TRACE_LN_THRESHOLD: f64 = -9.21;
-                const TRACE_LN_THRESHOLD_MARGIN: f64 = 1.0; // hysteresis band
-                const FLOOR_LN_THRESHOLD: f64 = -40.0;
+                let mut threshold_species: Option<usize> = None;
 
                 // Step-size control for trace species.
                 for j in 0..gas_species_pool.len() {
@@ -476,6 +537,7 @@ impl Mixture {
                             }
                         } else if deln_gas[j] > threshold {
                             threshold = deln_gas[j];
+                            threshold_species = Some(j);
                         }
                     } else if deln_gas[j] < 0.0 {
                         trace_damped[j] = false;
@@ -509,8 +571,14 @@ impl Mixture {
                 }
                 if c > 0 {
                     println!(
-                        "[debug]   newton_iter={} ambda={:.4e} dn_cond={:?} n_c={:?}",
-                        iterations, ambda, dn_cond, n_c
+                        "[debug]   newton_iter={} ambda={:.4e} dln_n={:.6e} threshold={:.6e} threshold_species={:?} dn_cond={:?} n_c={:?}",
+                        iterations,
+                        ambda,
+                        dln_n,
+                        threshold,
+                        threshold_species.map(|j| gas_species_pool[j].data().symbol()),
+                        dn_cond,
+                        n_c
                     );
                 }
 
@@ -552,11 +620,21 @@ impl Mixture {
                     break 'newton;
                 }
                 if c > 0 && iterations > 4990 {
+                    let (worst_j, worst_deln) = deln_gas
+                        .iter()
+                        .enumerate()
+                        .max_by(|(_, a), (_, b)| a.abs().partial_cmp(&b.abs()).unwrap())
+                        .map(|(j, v)| (j, *v))
+                        .unwrap();
                     println!(
-                        "[debug]   near-cap iter={} max_gas_update={:.6e} ambda*dln_n={:.6e}",
+                        "[debug]   near-cap iter={} max_gas_update={:.6e} ambda*dln_n={:.6e} worst_species={} worst_deln_gas={:.6e} enln={:.4} trace_damped={}",
                         iterations,
                         max_gas_update,
-                        (ambda * dln_n).abs()
+                        (ambda * dln_n).abs(),
+                        gas_species_pool[worst_j].data().symbol(),
+                        worst_deln,
+                        enln[worst_j],
+                        trace_damped[worst_j]
                     );
                 }
 
