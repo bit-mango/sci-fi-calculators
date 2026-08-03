@@ -32,7 +32,7 @@ use crate::nozzle::{
 };
 use crate::thermo::fluid_properties::ThermoReference;
 
-use crate::thermo::gibbs_min::*;
+use crate::thermo::equilibrium::*;
 
 fn main() {
     sweep_engine();

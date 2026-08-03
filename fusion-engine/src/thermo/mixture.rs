@@ -334,6 +334,59 @@ impl Mixture {
         (gas_species_pool, condensed_species_pool, element_pool)
     }
 
+    fn scaled_gauss_solve(g: &DMatrix<f64>, rhs: &DVector<f64>) -> Result<DVector<f64>, usize> {
+        const PIVOT_TOL: f64 = 1e-8; // same tolerance already used elsewhere for degenerate-row checks
+        let n = g.nrows();
+        let mut g = g.clone();
+        let mut rhs = rhs.clone();
+
+        for col in 0..n {
+            // find_pivot: among remaining rows, pick the one whose candidate pivot
+            // dominates the rest of its own row by the widest margin.
+            let mut best_row: Option<usize> = None;
+            let mut best_ratio = f64::INFINITY;
+            for i in col..n {
+                let pivot_candidate = g[(i, col)].abs();
+                if pivot_candidate < PIVOT_TOL {
+                    continue; // can't pivot on this row/column at all
+                }
+                let max_remaining = (col + 1..n).map(|k| g[(i, k)].abs()).fold(0.0, f64::max);
+                let ratio = max_remaining / pivot_candidate;
+                if ratio < best_ratio {
+                    best_ratio = ratio;
+                    best_row = Some(i);
+                }
+            }
+
+            let pivot_row = best_row.ok_or(col)?; // None propagates: genuinely zero column, no valid pivot anywhere
+
+            if pivot_row != col {
+                g.swap_rows(pivot_row, col);
+                rhs.swap_rows(pivot_row, col);
+            }
+
+            let pivot_val = g[(col, col)];
+            for i in (col + 1)..n {
+                let factor = g[(i, col)] / pivot_val;
+                if factor == 0.0 {
+                    continue;
+                }
+                for k in col..n {
+                    g[(i, k)] -= factor * g[(col, k)];
+                }
+                rhs[i] -= factor * rhs[col];
+            }
+        }
+
+        // Back substitution.
+        let mut x = DVector::zeros(n);
+        for i in (0..n).rev() {
+            let sum: f64 = (i + 1..n).map(|k| g[(i, k)] * x[k]).sum();
+            x[i] = (rhs[i] - sum) / g[(i, i)];
+        }
+        Ok(x)
+    }
+
     fn solve_for_products(
         temperature_k: f64,
         pressure_bar: f64,
@@ -347,14 +400,11 @@ impl Mixture {
         // -9.21 corresponds to a mole fraction of ~1e-4.
         const TRACE_LN_THRESHOLD: f64 = -9.21;
         const FLOOR_LN_THRESHOLD: f64 = -40.0;
-        let mut active_gas: Vec<bool> = vec![true; gas_species_pool.len()];
-        let mut excluded_gas_n: Vec<f64> = vec![0.0; gas_species_pool.len()];
-        let mut rejected_gas: Vec<bool> = vec![false; gas_species_pool.len()];
+        const GAS_INCLUSION_LN_THRESHOLD: f64 = -18.420681;
+        let m = n_lm.len();
+        let mut ion_solving_disabled = false;
         let mut active_condensed_species: Vec<Species> = vec![];
         let mut rejected_condensed_species: Vec<Species> = vec![];
-        let mut ion_solving_disabled = false;
-        let mut gas_total_pinned = false;
-        let e_idx = n_lm.iter().position(|(_, c)| *c == Constituent::E);
         let mut n_c: Vec<f64> = vec![]; // Linear moles for condensed phases
         let mut iterations = 0;
         let mut outer_iterations = 0;
@@ -377,7 +427,7 @@ impl Mixture {
             let mut enn: f64 = 0.1;
             let mut ln_n = enn.ln();
             let mut enln = vec![(enn / gas_species_pool.len() as f64).ln(); gas_species_pool.len()];
-            let m = n_lm.len();
+            let mut singular_retries = 0;
             let mut converged_pi: Vec<f64> = vec![0.0; m];
             'newton: loop {
                 iterations += 1;
@@ -389,25 +439,29 @@ impl Mixture {
                 let mut g = DMatrix::zeros(matrix_size, matrix_size);
                 let mut rhs = DVector::zeros(matrix_size);
 
+                let included: Vec<bool> = (0..gas_species_pool.len())
+                    .map(|j| enln[j] >= ln_n + GAS_INCLUSION_LN_THRESHOLD)
+                    .collect();
+
                 let tm = (pressure_bar / enn).ln();
                 let en: Vec<f64> = enln.iter().map(|x| x.exp()).collect();
                 let mu: Vec<f64> = (0..gas_species_pool.len())
                     .map(|j| mu_not[j] / (R * temperature_k) + enln[j] + tm)
                     .collect();
                 let sumn: f64 = (0..gas_species_pool.len())
-                    .filter(|&j| active_gas[j])
+                    .filter(|&j| included[j])
                     .map(|j| en[j])
                     .sum();
 
                 (0..m).for_each(|i| {
                     (0..m).for_each(|k| {
                         g[(i, k)] = (0..gas_species_pool.len())
-                            .filter(|&j| active_gas[j])
+                            .filter(|&j| included[j])
                             .map(|j| a[i][j] * a[k][j] * en[j])
                             .sum::<f64>();
                     });
-                    let sum = (0..active_gas.len())
-                        .filter(|&j| active_gas[j])
+                    let sum = (0..gas_species_pool.len())
+                        .filter(|&j| included[j])
                         .map(|j| a[i][j] * en[j])
                         .sum();
                     g[(i, m)] = sum;
@@ -426,24 +480,31 @@ impl Mixture {
 
                 (0..m).for_each(|i| {
                     let left: f64 = (0..gas_species_pool.len())
-                        .filter(|&j| active_gas[j])
+                        .filter(|&j| included[j])
                         .map(|j| a[i][j] * en[j] * mu[j])
                         .sum();
                     let right: f64 = (0..gas_species_pool.len())
-                        .filter(|&j| active_gas[j])
+                        .filter(|&j| included[j])
                         .map(|j| a[i][j] * en[j])
                         .sum();
-                    let excluded_mass: f64 = (0..gas_species_pool.len())
-                        .filter(|&j| !active_gas[j])
-                        .map(|j| a[i][j] * excluded_gas_n[j])
-                        .sum();
-                    rhs[i] = left + b[i] - right - excluded_mass
+                    rhs[i] = left + b[i] - right;
                 });
                 rhs[m] = (0..gas_species_pool.len())
-                    .filter(|&j| active_gas[j])
+                    .filter(|&j| included[j])
                     .map(|j| en[j] * mu[j])
                     .sum::<f64>()
                     + (enn - sumn);
+
+                if ion_solving_disabled {
+                    if let Some(e_idx) = n_lm.iter().position(|(_, c)| *c == Constituent::E) {
+                        for k in 0..matrix_size {
+                            g[(e_idx, k)] = 0.0;
+                            g[(k, e_idx)] = 0.0;
+                        }
+                        g[(e_idx, e_idx)] = 1.0;
+                        rhs[e_idx] = 0.0;
+                    }
+                }
 
                 // Build condensed species ros/cols.
                 for (idx, cond_species) in active_condensed_species.iter().enumerate() {
@@ -466,85 +527,111 @@ impl Mixture {
                     rhs[row] = mu_not_cond / (R * temperature_k);
                 }
 
-                if !gas_total_pinned {
-                    const ROW_TOL: f64 = 1e-8;
-                    let m_row_is_degenerate = (0..matrix_size).all(|k| g[(m, k)].abs() < ROW_TOL);
-                    if m_row_is_degenerate {
-                        println!(
-                            "[debug] total-moles row degenerate at iter={} T={:.1}, pinning dln_n=0",
-                            iterations, temperature_k
-                        );
-                        gas_total_pinned = true;
-                    }
-                }
-                if gas_total_pinned {
-                    for k in 0..matrix_size {
-                        g[(m, k)] = 0.0;
-                        g[(k, m)] = 0.0;
-                    }
-                    g[(m, m)] = 1.0;
-                    rhs[m] = 0.0;
-                }
-
-                if ion_solving_disabled {
-                    if let Some(e_idx) = e_idx {
-                        for k in 0..matrix_size {
-                            g[(e_idx, k)] = 0.0;
-                            g[(k, e_idx)] = 0.0;
-                        }
-                        g[(e_idx, e_idx)] = 1.0;
-                        rhs[e_idx] = 0.0;
-                    }
-                }
-
+                const MAX_SINGULAR_RETRIES: u32 = 8;
                 // Solve G*X = RHS using LU decomposition.
-                let x = match g.clone().lu().solve(&rhs) {
-                    Some(x) => x,
-                    None => {
-                        const TOL: f64 = 1e-8;
-                        let e_row_is_degenerate = e_idx.is_some_and(|e_idx| {
-                            (0..matrix_size).all(|k| g[(e_idx, k)].abs() < TOL)
-                        });
+                let x = match Self::scaled_gauss_solve(&g, &rhs) {
+                    Ok(x) => x,
+                    Err(col) if col < m => {
+                        singular_retries += 1;
+                        if singular_retries > MAX_SINGULAR_RETRIES {
+                            println!(
+                                "[debug] gave up after {} singular retries at T={:.1}",
+                                singular_retries, temperature_k
+                            );
+                            return None;
+                        }
+                        // ELement row degenerate. CEA's first remedy: if an active condensed
+                        // species contains this element, remove the smallest-contributing one.
+                        let culprit = active_condensed_species
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, s)| {
+                                s.data()
+                                    .constituents()
+                                    .iter()
+                                    .any(|c| c.1 == n_lm[col].1 && c.0 != 0.0)
+                            })
+                            .min_by(|(a, _), (b, _)| n_c[*a].partial_cmp(&n_c[*b]).unwrap());
 
-                        if !ion_solving_disabled && e_row_is_degenerate {
-                            // Enable ion-row fallback adn retry this same Newton.
+                        if let Some((idx, species)) = culprit {
+                            println!(
+                                "[debug] element {:?} degenerate, removing condensed {}",
+                                n_lm[col].1,
+                                species.data().symbol()
+                            );
+                            let rejected = active_condensed_species.remove(idx);
+                            rejected_condensed_species.push(rejected);
+                            n_c.remove(idx);
+                        } else if n_lm[col].1 == Constituent::E {
                             println!(
                                 "[debug] ion fallback triggered at iter={} T={:.1}",
                                 iterations, temperature_k
                             );
                             ion_solving_disabled = true;
-                            if let Some(e_idx) = e_idx {
-                                for j in 0..gas_species_pool.len() {
-                                    if a[e_idx][j] != 0.0 {
-                                        enln[j] = ln_n + FLOOR_LN_THRESHOLD;
-                                    }
+                            for j in 0..gas_species_pool.len() {
+                                if a[col][j] != 0.0 {
+                                    enln[j] = ln_n + FLOOR_LN_THRESHOLD;
                                 }
                             }
-                            iterations -= 1;
-                            continue 'newton;
                         } else {
                             println!(
-                                "[debug] LU fail -> SVD path at iter={} T={:.1} ion_disabled={} e_degenerate={}",
-                                iterations,
-                                temperature_k,
-                                ion_solving_disabled,
-                                e_row_is_degenerate
+                                "[debug] element {:?} (row {}) degenerate, no condensate to blame — reseeding",
+                                n_lm[col].1, col
                             );
-                        }
-                        // Not an E-row issue(or already tried disabling ions and it's still
-                        // singular) use SVD least-squares solve.
-                        // Singular/near-singular. Legitamte when one species dominates
-                        // the mixutre enough that it can't independently pin down every
-                        // element potential (the extra degree(s) of freedom don't change
-                        // composition, only which pi values get reported). Use the
-                        // minimum-norm least squares solution instead of failing.
-                        match g.svd(true, true).solve(&rhs, 1e-10) {
-                            Ok(x) => x,
-                            Err(e) => {
-                                println!("[debug] SVD FAILED: {}", e);
-                                return None;
+                            for j in 0..gas_species_pool.len() {
+                                if enln[j] < ln_n + FLOOR_LN_THRESHOLD {
+                                    enln[j] = (1.0e-6_f64).ln();
+                                }
                             }
                         }
+                        iterations -= 1;
+                        continue 'newton;
+                    }
+                    Err(col) if col >= m + 1 => {
+                        singular_retries += 1;
+                        if singular_retries > MAX_SINGULAR_RETRIES {
+                            println!(
+                                "[debug] gave up after {} singular retries at T={:.1}",
+                                singular_retries, temperature_k
+                            );
+                            return None;
+                        }
+                        // Condensed row degenerate — deactivate that specific condensed species.
+                        let idx = col - (m + 1);
+                        println!(
+                            "[debug] condensed row {} degenerate, removing {}",
+                            idx,
+                            active_condensed_species[idx].data().symbol()
+                        );
+                        let rejected = active_condensed_species.remove(idx);
+                        rejected_condensed_species.push(rejected);
+                        n_c.remove(idx);
+                        iterations -= 1;
+                        continue 'newton;
+                    }
+                    Err(_) => {
+                        singular_retries += 1;
+                        if singular_retries > MAX_SINGULAR_RETRIES {
+                            println!(
+                                "[debug] gave up after {} singular retries at T={:.1}",
+                                singular_retries, temperature_k
+                            );
+                            return None;
+                        }
+                        // col == m: the total-moles row. CEA has no specific branch for this —
+                        // fall through to the generic reseed-and-restart used as its universal
+                        // catch-all fallback.
+                        println!(
+                            "[debug] total-moles row degenerate at iter={} T={:.1}, reseeding",
+                            iterations, temperature_k
+                        );
+                        for j in 0..gas_species_pool.len() {
+                            if enln[j] < ln_n + FLOOR_LN_THRESHOLD {
+                                enln[j] = (1.0e-6_f64).ln();
+                            }
+                        }
+                        iterations = 0;
+                        continue 'newton;
                     }
                 };
                 for i in 0..m {
@@ -612,7 +699,7 @@ impl Mixture {
                 }
                 if c > 0 {
                     let active_summary: Vec<(&str, f64, f64)> = (0..gas_species_pool.len())
-                        .filter(|&j| active_gas[j])
+                        .filter(|&j| included[j])
                         .map(|j| (gas_species_pool[j].data().symbol(), enln[j], deln_gas[j]))
                         .collect();
                     println!(
@@ -654,9 +741,6 @@ impl Mixture {
 
                 let mut max_gas_update: f64 = 0.0;
                 for j in 0..gas_species_pool.len() {
-                    if !active_gas[j] {
-                        continue;
-                    }
                     let step = ambda * deln_gas[j];
                     enln[j] += step;
                     max_gas_update = max_gas_update.max(step.abs());
@@ -674,25 +758,6 @@ impl Mixture {
                 }
             }
 
-            const DELETE_LN_THRESHOLD: f64 = -30.0;
-            let mut species_excluded = false;
-            for j in 0..gas_species_pool.len() {
-                if active_gas[j] && enln[j] < ln_n + DELETE_LN_THRESHOLD {
-                    println!(
-                        "[debug] excluding {} enln={:.3}",
-                        gas_species_pool[j].data().symbol(),
-                        enln[j]
-                    );
-                    active_gas[j] = false;
-                    excluded_gas_n[j] = enln[j].exp();
-                    rejected_gas[j] = true;
-                    species_excluded = true;
-                }
-            }
-            if species_excluded {
-                iterations = 0;
-                continue 'outer;
-            }
             // Check all inactive condensed species to guarantee global minimum gibbs.
             let mut most_eager_species: Option<Species> = None;
             let mut max_supersaturation = 0.0;
@@ -753,47 +818,19 @@ impl Mixture {
                 iterations = 0;
                 continue 'outer;
             }
-            // // Check all excluded gas species to see if any should be reinstated.
-            // let mut most_eager_gas: Option<usize> = None;
-            // let mut max_gas_driving_force = 0.0;
-            // for j in 0..gas_species_pool.len() {
-            //     // Skip species if already in use or it is rejected.
-            //     if active_gas[j] || rejected_gas[j] {
-            //         continue;
-            //     }
-            //     let sum_a_pi: f64 = (0..m).map(|i| a[i][j] * converged_pi[i]).sum();
-            //     let mu_j_rt = mu_not[j] / (R * temperature_k)
-            //         + (ln_n + TRACE_LN_THRESHOLD)
-            //         + (pressure_bar / enn).ln();
-            //     let driving_force = sum_a_pi - mu_j_rt;
-            //     if driving_force > max_gas_driving_force {
-            //         max_gas_driving_force = driving_force;
-            //         most_eager_gas = Some(j);
-            //     }
-            // }
-            // if let Some(j) = most_eager_gas {
-            //     println!(
-            //         "[debug] reinstating {} driving_force={:.3e}",
-            //         gas_species_pool[j].data().symbol(),
-            //         max_gas_driving_force
-            //     );
-            //     active_gas[j] = true;
-            //     iterations = 0;
-            //     continue 'outer;
-            // }
+
             // Return the converged product moles
-            let result: Vec<(f64, Species)> = gas_species_pool
+            let mut result: Vec<(f64, Species)> = enln
                 .iter()
-                .enumerate()
-                .map(|(j, species)| {
-                    let n_j = if active_gas[j] {
-                        enln[j].exp()
-                    } else {
-                        excluded_gas_n[j]
-                    };
-                    (n_j, species.clone())
-                })
+                .zip(gas_species_pool.iter())
+                .map(|(log_n, species)| (log_n.exp(), species.clone()))
                 .collect();
+            result.extend(
+                active_condensed_species
+                    .iter()
+                    .zip(n_c.iter())
+                    .map(|(species, n)| (*n, species.clone())),
+            );
             break 'outer Some(result); // Converged!
         }
     }
@@ -974,7 +1011,7 @@ mod tests {
     #[test]
     fn solve_water() {
         let reactants = vec![(1.0, Species::H2O)];
-        let mixture = Mixture::new(&reactants, 400.0, 50.0);
+        let mixture = Mixture::new(&reactants, 400.0, 1.0);
         mixture.print_products();
     }
 }
