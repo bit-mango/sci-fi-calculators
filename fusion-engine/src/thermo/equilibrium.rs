@@ -50,6 +50,8 @@ struct TpSolveDebug {
     /// Final gas amounts, RAW (exp(ln_nj[j])), length ng.
     nj: Vec<f64>,
     n: f64,
+    /// Final temperature — equal to state1 for TP, solved-for otherwise.
+    temperature_k: f64,
 }
 
 struct MixtureThermo {
@@ -181,8 +183,22 @@ fn damping_lambda(ln_nj: &[f64], dln_nj: &[f64], dln_n: f64, dln_t: f64, n: f64,
 
 fn solve_for_products(
     reactants: &[(f64, Species)],
-    temperature_k: f64,
-    pressure_bar: f64,
+    // Section E.1: which state1/state2 pair this problem fixes. Only 't'
+    // (TP), 'h' (HP), and 's' (SP) are implemented so far — TV/UV/SV need
+    // const_v support, which isn't written yet.
+    const_t: bool,
+    // Only meaningful when !const_t: true = SP (state1 = S⁰/R), false = HP
+    // (state1 = H⁰/R). Selects the 's·' vs 'h·' branch of E.2's tmp_j table.
+    const_s: bool,
+    // true = P fixed (state2 = P [bar], TP/HP/SP); false = V fixed
+    // (state2 = V [m³/kg], TV — UV/SV aren't wired up yet). When !const_p,
+    // pressure is recomputed every iteration from the ideal-gas closure
+    // (Global conventions: P = 1e-5 * R * n * T / V) instead of being fixed.
+    const_p: bool,
+    // state1: T [K] if const_t; H⁰/R [kmol·K/kg] if HP; S⁰/R [kmol/kg] if SP.
+    state1: f64,
+    // state2: P [bar] if const_p, else V [m³/kg].
+    state2: f64,
     include_condensed: bool,
     include_ions: bool,
     // Restrict products to exactly this list (mirrors CEA's `only` keyword),
@@ -277,6 +293,15 @@ fn solve_for_products(
     // D.5 tolerances (guide's Global conventions).
     const NJ_TOL: f64 = 0.5e-5;
     const B_TOL: f64 = 1e-6;
+    const T_TOL: f64 = 1e-4;
+    const S_TOL: f64 = 0.5e-4;
+    // CEA's legacy R (Global conventions) — only needed here, for the P/V
+    // closure; every reduced thermo quantity elsewhere is already R-free.
+    const R_CEA: f64 = 8314.51;
+
+    // D.6: T = state1 for TP; otherwise starts at the fixed 3800K guess and
+    // becomes an unknown (ΔlnT) that the Newton iteration solves for.
+    let mut temperature_k = if const_t { state1 } else { 3800.0 };
 
     let mut ln_nj = vec![(0.1 / ng as f64).ln(); ns];
     let mut n: f64 = 0.1; // D.6: total gas moles, tracked as its own state var.
@@ -310,6 +335,14 @@ fn solve_for_products(
             &mut mixture_thermo,
         );
 
+        // Pressure/volume closure (Global conventions): fixed for const_p
+        // problems, otherwise recomputed each iteration from n/T (TV).
+        let pressure_bar = if const_p {
+            state2
+        } else {
+            1e-5 * R_CEA * n * temperature_k / state2
+        };
+
         // mu_g[j] (D.1): uses raw ln_nj, not the truncated nj_eff.
         let ln_p_over_n = (pressure_bar / n).ln();
         let mu_g: Vec<f64> = (0..ng)
@@ -337,7 +370,21 @@ fn solve_for_products(
             .collect();
         let n_delta = n - nj_eff.iter().sum::<f64>();
 
-        let neq = ne + 1;
+        // "h_j if const P, u_j if const V" (E.2a, E.3) — used wherever the
+        // guide's formula depends on P/V rather than on the energy type.
+        let energy_weight: Vec<f64> = if const_p {
+            mixture_thermo.enthalpy[..ng].to_vec()
+        } else {
+            mixture_thermo.energy[..ng].to_vec()
+        };
+
+        // E.1: unknown layout is [pi(ne) | dln_n (iff const_p) | dlnT (iff
+        // !const_t)]. For TV (const_t && !const_p) neq == ne: no Δln n and
+        // no ΔlnT unknown at all — n is just Σnj after each update (E.1),
+        // not solved for here.
+        let lnn_col = ne; // only valid to read/write when const_p
+        let lnt_col = ne + (const_p as usize); // only valid when !const_t
+        let neq = ne + (const_p as usize) + (!const_t as usize);
         let mut g: DMatrix<f64> = DMatrix::zeros(neq, neq + 1);
 
         for k in 0..ne {
@@ -347,13 +394,95 @@ fn solve_for_products(
                 // Σ_j a_kj * a_ij * n_j
                 g[(k, i)] = (0..ng).map(|j| tmp[j] * stoich[j][i]).sum::<f64>();
             }
-            g[(k, ne)] = tmp.iter().sum::<f64>(); // Δln n column
-            g[(ne, k)] = g[(k, ne)]; // symmetric fill of the moles row
+            if const_p {
+                g[(k, lnn_col)] = tmp.iter().sum::<f64>(); // Δln n column
+                g[(lnn_col, k)] = g[(k, lnn_col)]; // symmetric fill of the moles row
+            }
+            if !const_t {
+                // E.2a: element row's ΔlnT column = Σ_j a_kj * n_j * (h_j or
+                // u_j). Depends only on const_p/const_v, not on the energy
+                // type (const_s) — NOT generally equal to the energy row's
+                // own pi-column entry below, which uses the type-specific
+                // tmp_energy. They happen to coincide for HP/UV (tmp_energy
+                // == n_j*energy_weight there) but not for SP/SV, so this is
+                // filled on its own, not mirrored.
+                g[(k, lnt_col)] = (0..ng).map(|j| tmp[j] * energy_weight[j]).sum();
+            }
             g[(k, neq)] = b_delta[k] + (0..ng).map(|j| tmp[j] * mu_g[j]).sum::<f64>();
         }
-        // Moles row (Eq. 2.26); pi coefficients already filled symmetrically above.
-        g[(ne, ne)] = -n_delta;
-        g[(ne, neq)] = n_delta + (0..ng).map(|j| nj_eff[j] * mu_g[j]).sum::<f64>();
+        // Moles row (Eq. 2.26); pi coefficients already filled symmetrically
+        // above. Absent entirely for const_v (TV/UV/SV) — n isn't a Newton
+        // unknown there.
+        if const_p {
+            g[(lnn_col, lnn_col)] = -n_delta;
+            g[(lnn_col, neq)] = n_delta + (0..ng).map(|j| nj_eff[j] * mu_g[j]).sum::<f64>();
+        }
+        if !const_t {
+            // E.2b: moles row's ΔlnT column = Σ_j n_j * h_j (const_p only —
+            // there's no moles row at all otherwise, so always enthalpy,
+            // never energy_weight).
+            if const_p {
+                g[(lnn_col, lnt_col)] =
+                    (0..ng).map(|j| nj_eff[j] * mixture_thermo.enthalpy[j]).sum::<f64>();
+            }
+
+            // E.2c energy row. tmp_j/hsu_delta depend on the energy type:
+            //   HP ('h'): tmp_j = n_j*h_j            (energy_weight = h_j since const_p)
+            //   UV ('u'): tmp_j = n_j*u_j             (energy_weight = u_j since !const_p)
+            //   SP/SV ('s'): tmp_j = n_j*(h_j - mu_j) (always enthalpy, per the guide's table)
+            // hsu_delta = state1[/T] - Σ tmp_j in every case — the SP/SV
+            // residual (guide's Σ n_j(s_j - ln n_j - ln(P/n))) simplifies to
+            // the same Σ tmp_j because that bracket equals h_j - mu_g[j].
+            let tmp_energy: Vec<f64> = if const_s {
+                (0..ng)
+                    .map(|j| nj_eff[j] * (mixture_thermo.enthalpy[j] - mu_g[j]))
+                    .collect()
+            } else {
+                (0..ng).map(|j| nj_eff[j] * energy_weight[j]).collect()
+            };
+            let hsu_delta = (if const_s { state1 } else { state1 / temperature_k })
+                - tmp_energy.iter().sum::<f64>();
+
+            // Energy row's own pi columns and Δln n column — type-specific,
+            // computed independently rather than mirrored (see E.2a note).
+            // SV extra term (Eq. 2.48): !const_p && const_s subtracts the
+            // plain element-row sum on top of the tmp_energy-based one.
+            for i in 0..ne {
+                g[(lnt_col, i)] = (0..ng).map(|j| tmp_energy[j] * stoich[j][i]).sum::<f64>();
+                if !const_p && const_s {
+                    g[(lnt_col, i)] -= (0..ng).map(|j| nj_eff[j] * stoich[j][i]).sum::<f64>();
+                }
+            }
+            if const_p {
+                g[(lnt_col, lnn_col)] = tmp_energy.iter().sum::<f64>();
+            }
+
+            g[(lnt_col, lnt_col)] = if const_p {
+                (0..ng).map(|j| nj_eff[j] * mixture_thermo.cp[j]).sum::<f64>()
+                    + (0..ng).map(|j| tmp_energy[j] * mixture_thermo.enthalpy[j]).sum::<f64>()
+            } else {
+                let mut v = (0..ng).map(|j| nj_eff[j] * mixture_thermo.cv[j]).sum::<f64>()
+                    + (0..ng).map(|j| tmp_energy[j] * mixture_thermo.energy[j]).sum::<f64>();
+                if const_s {
+                    // SV extra term (Eq. 2.48).
+                    v -= (0..ng).map(|j| nj_eff[j] * mixture_thermo.energy[j]).sum::<f64>();
+                }
+                v
+            };
+            // const_s's extra RHS term differs by const_p: SP adds n_delta,
+            // SV subtracts Σ nj_eff*mu_g instead (Eq. 2.28 vs 2.48).
+            let extra = if const_s {
+                if const_p {
+                    n_delta
+                } else {
+                    -(0..ng).map(|j| nj_eff[j] * mu_g[j]).sum::<f64>()
+                }
+            } else {
+                0.0
+            };
+            g[(lnt_col, neq)] =
+                hsu_delta + (0..ng).map(|j| tmp_energy[j] * mu_g[j]).sum::<f64>() + extra;
+        }
 
         // Snapshot the assembled (pre-solve) matrix from the very first pass
         // only — that's the canonical-guess matrix Section D validation
@@ -362,17 +491,24 @@ fn solve_for_products(
             assembled_first_iteration = Some(g.clone());
         }
 
-        // Solve for [pi_0..pi_{ne-1}, dln_n], then recover dln_nj (Eq. 2.18).
+        // Solve for [pi_0..pi_{ne-1}, dln_n, (dlnT)], then recover dln_nj
+        // (Eq. 2.18, gaining the ΔlnT*h_j term for variable-T problems, E.3).
         gauss(&mut g).expect("singular matrix recovery is Section G, not implemented yet");
         let pi: Vec<f64> = (0..ne).map(|i| g[(i, neq)]).collect();
-        let dln_n = g[(ne, neq)];
+        // TV: no Δln n unknown at all — dln_n stays 0 (E.1).
+        let dln_n = if const_p { g[(lnn_col, neq)] } else { 0.0 };
+        let dln_t = if const_t { 0.0 } else { g[(lnt_col, neq)] };
         let dln_nj: Vec<f64> = (0..ng)
-            .map(|j| -mu_g[j] + dln_n + (0..ne).map(|i| stoich[j][i] * pi[i]).sum::<f64>())
+            .map(|j| {
+                -mu_g[j]
+                    + dln_n
+                    + (0..ne).map(|i| stoich[j][i] * pi[i]).sum::<f64>()
+                    + dln_t * energy_weight[j] // h_j if const_p, u_j if const_v (E.3)
+            })
             .collect();
 
-        // D.2: cap the step before it's applied. dln_t = 0.0 — no ΔlnT
-        // unknown yet for this TP-only driver (Section E).
-        let lambda = damping_lambda(&ln_nj[..ng], &dln_nj, dln_n, 0.0, n, SIZE);
+        // D.2: cap the step before it's applied.
+        let lambda = damping_lambda(&ln_nj[..ng], &dln_nj, dln_n, dln_t, n, SIZE);
 
         // D.3: apply the damped update. nj_stored's truncation threshold
         // uses the OLD n (not yet updated below) — matches the guide's
@@ -385,21 +521,51 @@ fn solve_for_products(
             nj_stored[j] = if ln_nj[j] > threshold { ln_nj[j].exp() } else { 0.0 };
         }
         let applied_dln_n = lambda * dln_n;
-        // const_p is always true for TP — the const_v branch (n = Σ nj)
-        // arrives with Section E's TV/UV/SV problem types.
-        n = (n.ln() + applied_dln_n).exp();
+        n = if const_p {
+            (n.ln() + applied_dln_n).exp()
+        } else {
+            // TV: n isn't a Newton unknown — it's just Σ nj after the
+            // species update (E.1), using the freshly truncated amounts.
+            nj_stored.iter().sum()
+        };
+        let applied_dln_t = lambda * dln_t;
+        if !const_t {
+            temperature_k = (temperature_k.ln() + applied_dln_t).exp();
+        }
 
-        // D.5: convergence check. Only the tests that apply to a gas-only,
-        // fixed-T, fixed-P problem: no condensed (test 2), always const_p
-        // (test 3 applies), const_t (test 5 skipped), no entropy/trace/ions
-        // (tests 6-7 skipped).
+        // D.3 (cont.): the guide's update_solution recomputes thermo at the
+        // new T before returning — needed here so test 6 (entropy, SP) reads
+        // s_j at the state actually being checked for convergence, not the
+        // pre-update one still sitting in `mixture_thermo`.
+        let mut mixture_thermo_post = MixtureThermo {
+            cp: vec![0.0; ns],
+            cv: vec![0.0; ns],
+            enthalpy: vec![0.0; ns],
+            entropy: vec![0.0; ns],
+            energy: vec![0.0; ns],
+        };
+        calc_thermo(
+            &species,
+            temperature_k,
+            ng,
+            nc,
+            include_condensed,
+            &mut mixture_thermo_post,
+        );
+
+        // D.5: convergence check. Only the tests that apply here: no
+        // condensed (test 2), total moles (test 3, only when const_p — for
+        // TV, n is a direct sum, not a Newton unknown, so there's nothing to
+        // check separately from test 1), temperature (test 5, only when
+        // !const_t), entropy (test 6, only when const_s), no trace/ions
+        // (test 7).
         let sum_nj: f64 = nj_stored.iter().sum(); // no condensed yet, so gas-only sum
 
         // Test 1: gas species.
         let test1 = (0..ng).all(|j| nj_stored[j] * applied_dln_nj[j].abs() / sum_nj <= NJ_TOL);
 
-        // Test 3: total moles (const_p only, which TP always is).
-        let test3 = n * applied_dln_n.abs() / sum_nj <= NJ_TOL;
+        // Test 3: total moles (const_p only).
+        let test3 = !const_p || n * applied_dln_n.abs() / sum_nj <= NJ_TOL;
 
         // Test 4: elements, using RAW nj (not the stored/truncated values).
         let b_max = b0.iter().cloned().fold(0.0_f64, f64::max);
@@ -411,7 +577,27 @@ fn solve_for_products(
             (b0[k] - b_k).abs() <= B_TOL * b_max
         });
 
-        if test1 && test3 && test4 {
+        // Test 5: temperature (only for variable-T problems).
+        let test5 = const_t || applied_dln_t.abs() <= T_TOL;
+
+        // Test 6: entropy (SP only). s_delta = state1 - Σ_gas nj*(s_j - ln
+        // nj - ln(P/n)), evaluated at the post-update state (RAW ln_nj, like
+        // test 4 — the ln(nj) term isn't meaningful for a truncated 0).
+        let test6 = if const_s {
+            let new_ln_p_over_n = (pressure_bar / n).ln();
+            let s_delta = state1
+                - (0..ng)
+                    .map(|j| {
+                        let nj_raw = ln_nj[j].exp();
+                        nj_raw * (mixture_thermo_post.entropy[j] - ln_nj[j] - new_ln_p_over_n)
+                    })
+                    .sum::<f64>();
+            s_delta.abs() <= S_TOL
+        } else {
+            true
+        };
+
+        if test1 && test3 && test4 && test5 && test6 {
             converged = true;
             break;
         }
@@ -425,6 +611,7 @@ fn solve_for_products(
         iterations_used,
         nj,
         n,
+        temperature_k,
     }
 }
 
@@ -442,6 +629,19 @@ fn element_amounts(reactants: &[(f64, Species)], constituent_pool: &[Constituent
         }
     }
     b0
+}
+
+// state1 for HP problems (Appendix AI.2.6): the reactants' assigned
+// enthalpy at their own reference temperature, divided by R.
+// state1 = Σ_j x_j * H_j(T_init) / (R * Σ_j x_j * M_j)  [kmol*K/kg]
+// h_over_r already returns H_j(T)/R directly (Kelvin units, guide A.1).
+fn reactant_enthalpy_over_r(reactants: &[(f64, Species)], reactant_temperature_k: f64) -> f64 {
+    let total_mass: f64 = reactants.iter().map(|(x, sp)| x * sp.data().mw()).sum();
+    reactants
+        .iter()
+        .map(|(x, sp)| x * sp.data().h_over_r(reactant_temperature_k))
+        .sum::<f64>()
+        / total_mass
 }
 
 #[cfg(test)]
@@ -558,7 +758,9 @@ mod d1_assembly_validation {
             Species::OH,
         ];
 
-        let result = solve_for_products(&reactants, 3800.0, 1.01325, false, false, Some(&only));
+        let result = solve_for_products(
+            &reactants, true, false, true, 3800.0, 1.01325, false, false, Some(&only),
+        );
         let g = &result.assembled_first_iteration;
 
         #[rustfmt::skip]
@@ -626,6 +828,9 @@ mod d5_convergence_validation {
         let pressure_bar = 1.01325;
         let result = solve_for_products(
             &reactants,
+            true,
+            false,
+            true,
             temperature_k,
             pressure_bar,
             false,
@@ -679,6 +884,370 @@ mod d5_convergence_validation {
                 (mu[j] - predicted).abs() < 1e-6,
                 "species {j}: mu/RT = {}, a.pi = {predicted}",
                 mu[j]
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod e_hp_validation {
+    //! Section E validation, test_h2_o2 (J.1) — this is finally the real
+    //! deal: an HP problem, which is what J.1 actually is (unlike D's
+    //! TP-only tests, which had to fall back to independently-derived
+    //! numbers because J.1 didn't apply). Both the canonical-guess matrix
+    //! AND the converged T/mole fractions are the guide's actual numbers.
+    use super::*;
+
+    fn h2_o2_reactants() -> [(f64, Species); 2] {
+        let of_ratio = 15.87336;
+        let mw_h2 = Species::H2.data().mw();
+        let mw_o2 = Species::O2.data().mw();
+        [(1.0 / mw_h2, Species::H2), (of_ratio / mw_o2, Species::O2)]
+    }
+
+    fn only_h2_o2_products() -> [Species; 6] {
+        [
+            Species::H,
+            Species::H2,
+            Species::H2O,
+            Species::O,
+            Species::O2,
+            Species::OH,
+        ]
+    }
+
+    #[test]
+    fn assembles_h2_o2_hp_initial_matrix() {
+        let reactants = h2_o2_reactants();
+        let only = only_h2_o2_products();
+        let state1 = reactant_enthalpy_over_r(&reactants, 2000.0);
+
+        let result = solve_for_products(&reactants, false, false, true, state1, 1.01325, false, false, Some(&only));
+        let g = &result.assembled_first_iteration;
+
+        #[rustfmt::skip]
+        let expected: [[f64; 5]; 4] = [
+            [0.16666666666666666, 0.05,                 0.1,                 0.29041578093904313, -2.8522519562949125],
+            [0.05,                 0.11666666666666667, 0.083333333333333,   0.35522308781408640, -2.5626653151659138],
+            [0.1,                  0.083333333333333,   0.0,                 0.50248557985367082, -2.5915522029331699],
+            [0.29041578093904313,  0.35522308781408640, 0.50248557985367082, 4.60022515802027690, -10.014870869177022],
+        ];
+
+        assert_eq!(g.nrows(), 4, "expected 2 elements + dln_n + dlnT = 4 equations");
+        for r in 0..4 {
+            for c in 0..5 {
+                let got = g[(r, c)];
+                assert!(
+                    (got - expected[r][c]).abs() < 1e-6,
+                    "G[{r}][{c}] = {got}, expected {}",
+                    expected[r][c]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn converges_h2_o2_hp_to_guide_numbers() {
+        let reactants = h2_o2_reactants();
+        let only = only_h2_o2_products();
+        let state1 = reactant_enthalpy_over_r(&reactants, 2000.0);
+
+        let result = solve_for_products(&reactants, false, false, true, state1, 1.01325, false, false, Some(&only));
+
+        assert!(
+            result.converged,
+            "did not converge within {} iterations",
+            result.iterations_used
+        );
+
+        assert!(
+            (result.temperature_k - 3181.2589964650856).abs() < 1e-3,
+            "T = {}, expected 3181.2589964650856",
+            result.temperature_k
+        );
+
+        // [H, H2, H2O, O, O2, OH]
+        let expected_x = [
+            0.06590368364478945,
+            0.06152807617606959,
+            0.37638785326991414,
+            0.09771754800744899,
+            0.23381507062970186,
+            0.16464776827208294,
+        ];
+        let total: f64 = result.nj.iter().sum();
+        for (j, &expected_xj) in expected_x.iter().enumerate() {
+            let xj = result.nj[j] / total;
+            assert!(
+                (xj - expected_xj).abs() < 1e-6,
+                "species {j}: x = {xj}, expected {expected_xj}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod e_sp_validation {
+    //! Section E validation, test_sp_problem (J.4): equimolar H2/O2, SP at
+    //! 1.01325 bar. Unlike HP, the guide gives the converged ln_nj directly
+    //! (not just mole fractions), so this checks ln_nj to the guide's own
+    //! 1e-6 relative tolerance rather than reconstructing mole fractions.
+    use super::*;
+
+    #[test]
+    fn converges_h2_o2_sp_to_guide_numbers() {
+        let reactants = [(1.0, Species::H2), (1.0, Species::O2)];
+        let only = [
+            Species::H,
+            Species::H2,
+            Species::H2O,
+            Species::O,
+            Species::O2,
+            Species::OH,
+        ];
+        let state1 = 1.804; // S/R, given directly by the guide (J.4).
+
+        let result =
+            solve_for_products(&reactants, false, true, true, state1, 1.01325, false, false, Some(&only));
+
+        assert!(
+            result.converged,
+            "did not converge within {} iterations",
+            result.iterations_used
+        );
+        assert!(
+            (result.temperature_k - 3244.7454823232674).abs() < 1e-3,
+            "T = {}, expected 3244.7454823232674",
+            result.temperature_k
+        );
+
+        // order: H, H2, H2O, O, O2, OH
+        let expected_ln_nj = [
+            -5.3971690318524281,
+            -5.5822036166964706,
+            -3.9841684012236138,
+            -5.0642456920269865,
+            -4.4084879383149573,
+            -4.6538971360500030,
+        ];
+        for (j, &expected) in expected_ln_nj.iter().enumerate() {
+            let got = result.nj[j].ln();
+            assert!(
+                (got - expected).abs() < 1e-6,
+                "species {j}: ln_nj = {got}, expected {expected}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod e_sv_validation {
+    //! Section E validation, test_sv_problem (J.4): same reactants/entropy
+    //! target as SP, but V fixed instead of P. The guide gives the
+    //! converged ln_nj directly, so — like SP — this checks ln_nj at 1e-6
+    //! rather than reconstructing mole fractions.
+    use super::*;
+
+    #[test]
+    fn converges_h2_o2_sv_to_guide_numbers() {
+        let reactants = [(1.0, Species::H2), (1.0, Species::O2)];
+        let only = [
+            Species::H,
+            Species::H2,
+            Species::H2O,
+            Species::O,
+            Species::O2,
+            Species::OH,
+        ];
+        let state1 = 1.804; // S/R, same as SP (J.4).
+        let volume = 1.0 / 0.072081; // m^3/kg
+
+        let result = solve_for_products(
+            &reactants, false, true, false, state1, volume, false, false, Some(&only),
+        );
+
+        assert!(
+            result.converged,
+            "did not converge within {} iterations",
+            result.iterations_used
+        );
+        assert!(
+            (result.temperature_k - 3258.5925134713739).abs() < 1e-3,
+            "T = {}, expected 3258.5925134713739",
+            result.temperature_k
+        );
+
+        // order: H, H2, H2O, O, O2, OH
+        let expected_ln_nj = [
+            -5.3856081862190726,
+            -5.5747945411551276,
+            -3.9891190704470452,
+            -5.0532891277264751,
+            -4.4106610522293108,
+            -4.6460395167270923,
+        ];
+        for (j, &expected) in expected_ln_nj.iter().enumerate() {
+            let got = result.nj[j].ln();
+            assert!(
+                (got - expected).abs() < 1e-6,
+                "species {j}: ln_nj = {got}, expected {expected}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod e_tv_validation {
+    //! Section E validation, TV. The guide's own J.2/J.3 pair (test_h2_air /
+    //! test_example2) is exactly a TP-at-(T,P) vs TV-at-the-equivalent-V
+    //! cross-check ("TV at the equivalent volume reproduces the TP state" —
+    //! an "excellent cross-check" per the guide) — but it uses the H2/air
+    //! 20-species system we can't reproduce (see d1_assembly_validation's
+    //! note). So: do the same cross-check ourselves on H2/O2. Solve TP,
+    //! derive V from its converged n via the same ideal-gas closure
+    //! solve_for_products itself uses, then confirm TV at that V reproduces
+    //! the identical composition.
+    use super::*;
+
+    #[test]
+    fn tv_at_equivalent_volume_reproduces_tp_state() {
+        const R_CEA: f64 = 8314.51;
+        let of_ratio = 15.87336;
+        let mw_h2 = Species::H2.data().mw();
+        let mw_o2 = Species::O2.data().mw();
+        let reactants = [(1.0 / mw_h2, Species::H2), (of_ratio / mw_o2, Species::O2)];
+        let only = [
+            Species::H,
+            Species::H2,
+            Species::H2O,
+            Species::O,
+            Species::O2,
+            Species::OH,
+        ];
+        let temperature_k = 3800.0;
+        let pressure_bar = 1.01325;
+
+        let tp = solve_for_products(
+            &reactants,
+            true,
+            false,
+            true,
+            temperature_k,
+            pressure_bar,
+            false,
+            false,
+            Some(&only),
+        );
+        assert!(tp.converged);
+
+        // P = 1e-5 * R * n * T / V  =>  V = 1e-5 * R * n * T / P
+        let equivalent_volume = 1e-5 * R_CEA * tp.n * temperature_k / pressure_bar;
+
+        let tv = solve_for_products(
+            &reactants,
+            true,
+            false,
+            false,
+            temperature_k,
+            equivalent_volume,
+            false,
+            false,
+            Some(&only),
+        );
+        assert!(tv.converged, "TV did not converge in {} iters", tv.iterations_used);
+
+        assert!(
+            (tv.n - tp.n).abs() / tp.n < 1e-6,
+            "n: TV = {}, TP = {}",
+            tv.n,
+            tp.n
+        );
+        for j in 0..6 {
+            let tv_ln = tv.nj[j].ln();
+            let tp_ln = tp.nj[j].ln();
+            assert!(
+                (tv_ln - tp_ln).abs() < 1e-6,
+                "species {j}: TV ln_nj = {tv_ln}, TP ln_nj = {tp_ln}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod e_uv_validation {
+    //! Section E validation, UV. J.6 (test_example4) is the guide's only UV
+    //! case, but it's a 92-species trace-mode stress test with condensed
+    //! species — not reproducible here any more than J.2's 20-species TV
+    //! case was. So: the same self-derived cross-check as TV, but for the
+    //! other closure. Solve TP, derive UV's (state1 = U⁰/R, V) from that
+    //! converged state, then confirm UV reproduces it.
+    use super::*;
+
+    #[test]
+    fn uv_at_equivalent_state_reproduces_tp_state() {
+        const R_CEA: f64 = 8314.51;
+        let of_ratio = 15.87336;
+        let mw_h2 = Species::H2.data().mw();
+        let mw_o2 = Species::O2.data().mw();
+        let reactants = [(1.0 / mw_h2, Species::H2), (of_ratio / mw_o2, Species::O2)];
+        let species = [
+            Species::H,
+            Species::H2,
+            Species::H2O,
+            Species::O,
+            Species::O2,
+            Species::OH,
+        ];
+        let temperature_k = 3800.0;
+        let pressure_bar = 1.01325;
+
+        let tp = solve_for_products(
+            &reactants,
+            true,
+            false,
+            true,
+            temperature_k,
+            pressure_bar,
+            false,
+            false,
+            Some(&species),
+        );
+        assert!(tp.converged);
+
+        // At convergence, hsu_delta = state1/T - Σ nj*u_j == 0, so
+        // state1 = T * Σ nj*(u_over_r(T)/T) = Σ nj*u_over_r(T) — the T
+        // cancels, so this is just a plain weighted sum of u_over_r.
+        let state1_uv: f64 = (0..6)
+            .map(|j| tp.nj[j] * species[j].data().u_over_r(tp.temperature_k))
+            .sum();
+        // Same P/V closure as TV.
+        let equivalent_volume = 1e-5 * R_CEA * tp.n * temperature_k / pressure_bar;
+
+        let uv = solve_for_products(
+            &reactants,
+            false,
+            false,
+            false,
+            state1_uv,
+            equivalent_volume,
+            false,
+            false,
+            Some(&species),
+        );
+        assert!(uv.converged, "UV did not converge in {} iters", uv.iterations_used);
+
+        assert!(
+            (uv.temperature_k - tp.temperature_k).abs() < 1e-3,
+            "T: UV = {}, TP = {}",
+            uv.temperature_k,
+            tp.temperature_k
+        );
+        for j in 0..6 {
+            let uv_ln = uv.nj[j].ln();
+            let tp_ln = tp.nj[j].ln();
+            assert!(
+                (uv_ln - tp_ln).abs() < 1e-6,
+                "species {j}: UV ln_nj = {uv_ln}, TP ln_nj = {tp_ln}"
             );
         }
     }
