@@ -14,6 +14,34 @@ pub enum EquilibriumError {
     FailedToConverge { iterations_used: usize },
 }
 
+/// Thermodynamic state specification for equilibrium calculation.
+pub enum EquilibriumMode {
+    /// Fixed temperature and pressure
+    TP {
+        temperature_k: f64,
+        pressure_bar: f64,
+    },
+    /// Fixed enthalpy and pressure (temperature solved)
+    HP { h_over_r: f64, pressure_bar: f64 },
+    /// Fixed entropy and pressure (temperature solved)
+    SP { s_over_r: f64, pressure_bar: f64 },
+    /// Fixed temperature and volume (pressure computed)
+    TV {
+        temperature_k: f64,
+        volume_m3_per_kg: f64,
+    },
+    /// Fixed internal energy and volume (temperature & pressure computed)
+    UV {
+        u_over_r: f64,
+        volume_m3_per_kg: f64,
+    },
+    /// Fixed entropy and volume (temperature & pressure computed)
+    SV {
+        s_over_r: f64,
+        volume_m3_per_kg: f64,
+    },
+}
+
 /// Internal debug struct for validation and testing.
 struct EquilibriumDebug {
     assembled_first_iteration: DMatrix<f64>,
@@ -1696,25 +1724,45 @@ fn solve_for_products_debug(
 ///
 /// # Arguments
 /// * `reactants` - Initial composition as (mass or mole amount, Species) pairs
-/// * `const_t` - If true, temperature is fixed (TP); otherwise solved-for (HP/SP/TV/UV/SV)
-/// * `const_s` - If true, entropy is fixed (SP/SV); ignored if const_t=true
-/// * `const_p` - If true, pressure is fixed; otherwise volume is fixed (TV/UV/SV)
-/// * `state1` - T [K] if const_t; H⁰/R if HP; S⁰/R if SP/SV; otherwise unused
-/// * `state2` - P [bar] if const_p, else V [m³/kg]
+/// * `mode` - Thermodynamic mode specification (TP, HP, SP, TV, UV, or SV)
 /// * `include_condensed` - Include condensed (solid/liquid) species
 /// * `include_ions` - Include ionic species
 /// * `only` - Restrict products to this list, or None for auto-generated pool
 pub fn solve_for_products(
     reactants: &[(f64, Species)],
-    const_t: bool,
-    const_s: bool,
-    const_p: bool,
-    state1: f64,
-    state2: f64,
+    mode: EquilibriumMode,
     include_condensed: bool,
     include_ions: bool,
     only: Option<&[Species]>,
 ) -> Result<EquilibriumState, EquilibriumError> {
+    // Unpack mode into internal parameters
+    let (const_t, const_s, const_p, state1, state2) = match mode {
+        EquilibriumMode::TP {
+            temperature_k,
+            pressure_bar,
+        } => (true, false, true, temperature_k, pressure_bar),
+        EquilibriumMode::HP {
+            h_over_r,
+            pressure_bar,
+        } => (false, false, true, h_over_r, pressure_bar),
+        EquilibriumMode::SP {
+            s_over_r,
+            pressure_bar,
+        } => (false, true, true, s_over_r, pressure_bar),
+        EquilibriumMode::TV {
+            temperature_k,
+            volume_m3_per_kg,
+        } => (true, false, false, temperature_k, volume_m3_per_kg),
+        EquilibriumMode::UV {
+            u_over_r,
+            volume_m3_per_kg,
+        } => (false, false, false, u_over_r, volume_m3_per_kg),
+        EquilibriumMode::SV {
+            s_over_r,
+            volume_m3_per_kg,
+        } => (false, true, false, s_over_r, volume_m3_per_kg),
+    };
+
     let debug_result = solve_for_products_debug(
         reactants,
         const_t,
@@ -1976,11 +2024,10 @@ mod d5_convergence_validation {
         let pressure_bar = 1.01325;
         let state = solve_for_products(
             &reactants,
-            true,
-            false,
-            true,
-            temperature_k,
-            pressure_bar,
+            EquilibriumMode::TP {
+                temperature_k,
+                pressure_bar,
+            },
             false,
             false,
             Some(&only),
@@ -2176,11 +2223,10 @@ mod e_sp_validation {
 
         let state = solve_for_products(
             &reactants,
-            false,
-            true,
-            true,
-            state1,
-            1.01325,
+            EquilibriumMode::SP {
+                s_over_r: state1,
+                pressure_bar: 1.01325,
+            },
             false,
             false,
             Some(&only),
