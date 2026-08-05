@@ -22,17 +22,15 @@ mod engine;
 mod hybrid_engine;
 mod nozzle;
 mod thermo;
-use crate::engine::cooling::{
-    calculate_heat_state, calculate_heat_state_ammonia, calculate_heat_state_urea,
-};
+// use crate::engine::cooling::{
+//     calculate_heat_state, calculate_heat_state_ammonia, calculate_heat_state_urea,
+// };
 use crate::hybrid_engine::sweep_engine;
-use crate::nozzle::{
-    full_equilibrium_flow::calculate_full_quilibrium_flow_results,
-    propellant::{Propellant, Species},
-};
-use crate::thermo::fluid_properties::ThermoReference;
+// use crate::nozzle::{
+// full_equilibrium_flow::calculate_full_quilibrium_flow_results,
+// };
 
-use crate::thermo::equilibrium::*;
+// use crate::thermo::equilibrium::*;
 
 fn main() {
     sweep_engine();

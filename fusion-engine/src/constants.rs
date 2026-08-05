@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 pub const R: f64 = 8.314; // Ideal Gas Constant [J/mol•K]
 pub const G_0: f64 = 9.80665;
 pub const F: f64 = 96_485.332; // Faraday constant, C/mol

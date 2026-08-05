@@ -1,8 +1,7 @@
 use crate::constants::*;
 use crate::nozzle::area_ratio::exit_pressure_from_area_ratio;
-use crate::thermo::fluid_properties::ThermoReference;
 use std::f64::consts::PI;
-use thermo_species::{AnySpeciesData, Constituent, Species, species};
+use thermo_species::Species;
 
 use crate::thermo::mixture::Mixture;
 
@@ -56,21 +55,16 @@ fn funnel_convergence_half_angle_deg(
         .to_degrees()
 }
 
-fn solve_for_chamber_state(
-    tr: &ThermoReference,
-    q_chamber: f64,
-    ions: &Mixture,
-    diluent: Option<&Mixture>,
-) -> Mixture {
+fn solve_for_chamber_state(q_chamber: f64, ions: &Mixture, diluent: Option<&Mixture>) -> Mixture {
     // Mix ions and diluent.
     let mixture = if let Some(diluent) = diluent {
-        ions.mix(tr, diluent)
+        ions.mix(diluent)
     } else {
         ions.clone()
     };
     let target_enthalpy = mixture.h_total + q_chamber;
 
-    mixture.solve_for_target_enthalpy(tr, target_enthalpy)
+    mixture.solve_for_target_enthalpy(target_enthalpy)
 }
 
 fn choked_throat_area(
@@ -99,8 +93,8 @@ fn choked_chamber_pressure_bar(
     pressure_pa / 1.0e5
 }
 
+#[allow(clippy::too_many_arguments)]
 fn calculate_engine_output(
-    tr: &ThermoReference,
     field_voltage: f64,
     collision_theta_deg: f64,
     engine_power: f64,
@@ -112,7 +106,6 @@ fn calculate_engine_output(
     gap_spacing: f64,
     aperture_diameter: f64,
     funnel_length: f64,
-    t_allowed_max_chamber: f64,
     coupling_efficiency: f64,
     fixed_total_throat_area: Option<f64>,
 ) -> (Option<f64>, Option<f64>) {
@@ -170,12 +163,12 @@ fn calculate_engine_output(
     // fully mix with other chamber species.
     let q_chamber_diluent = q_chamber * coupling_efficiency + q_mixing; // J/mol
 
-    let plasma = cations.mix(tr, anions);
-    let plasma_species = plasma.scale(tr, 1.0 - coupling_efficiency);
-    let chamber_plasma_state = solve_for_chamber_state(tr, q_chamber_plasma, &plasma_species, None);
-    let diluent_species = plasma.scale(tr, coupling_efficiency);
+    let plasma = cations.mix(anions);
+    let plasma_species = plasma.scale(1.0 - coupling_efficiency);
+    let chamber_plasma_state = solve_for_chamber_state(q_chamber_plasma, &plasma_species, None);
+    let diluent_species = plasma.scale(coupling_efficiency);
     let chamber_diluent_state =
-        solve_for_chamber_state(tr, q_chamber_diluent, &diluent_species, Some(diluent));
+        solve_for_chamber_state(q_chamber_diluent, &diluent_species, Some(diluent));
 
     // Handle fast flow.
     // Mixture properties.
@@ -192,7 +185,6 @@ fn calculate_engine_output(
         * (exit_pressure / chamber_pressure).powf((mixture_gamma - 1.0) / mixture_gamma);
     let plasma_species = Mixture::new(&plasma_species.products, exit_temperature, exit_pressure);
     let plasma_species_low = Mixture::new_with_frozen_reactants(
-        tr,
         &chamber_plasma_state.products,
         exit_temperature,
         exit_pressure,
@@ -246,10 +238,9 @@ fn calculate_engine_output(
     // Nozzle expansion. full equilibrium flow for upper bound Isp.
     let exit_temperature = chamber_diluent_state.temperature_k
         * (exit_pressure / chamber_pressure).powf((mixture_gamma - 1.0) / mixture_gamma);
-    let diluent_species = diluent_species.mix(tr, diluent);
+    let diluent_species = diluent_species.mix(diluent);
     let diluent_species = Mixture::new(&diluent_species.products, exit_temperature, exit_pressure);
     let diluent_species_low = Mixture::new_with_frozen_reactants(
-        tr,
         &chamber_diluent_state.products,
         exit_temperature,
         exit_pressure,
@@ -353,7 +344,7 @@ fn calculate_engine_output(
 
     // Nozzle Design
     let slow_m_dot = ions_m_dot * coupling_efficiency + diluent_m_dot;
-    let results = if let Some(fixed_area) = fixed_total_throat_area {
+    if let Some(fixed_area) = fixed_total_throat_area {
         let available_annulus_area = fixed_area - max_channel_area;
         let actual_chamber_pressure = choked_chamber_pressure_bar(
             slow_m_dot,
@@ -381,8 +372,7 @@ fn calculate_engine_output(
             fixed_total_area_throat * 1.0e6
         );
         (None, Some(fixed_total_area_throat))
-    };
-    results
+    }
 }
 
 // TODO RENAME OOGA BOOGA VARIABLES IN THIS like all the state stuff.
@@ -398,18 +388,16 @@ pub fn sweep_engine() {
     let gap_spacing = 0.05e-3;
     let aperture_diameter = 0.5e-3;
     let funnel_length = 7.0; // meters
-    let t_allowed_max_chamber = 20_000.0; // When using water diluent
     let chamber_pressure = 10.0;
-    let tr = ThermoReference::new();
 
     // Methane clathrate is CH4•5.75H2O
     let cations = Mixture::new(
-        &vec![(1.0, Species::CH4), (1.0, Species::HPlus)], // Stand in for CH5+ which there is no CEA data for.
+        &[(1.0, Species::CH4), (1.0, Species::HPlus)], // Stand in for CH5+ which there is no CEA data for.
         373.0,
         chamber_pressure,
     );
-    let anions = Mixture::new(&vec![(1.0, Species::OHNeg)], 300.0, chamber_pressure);
-    let diluent = Mixture::new(&vec![(38.00, Species::H2O)], 1_000.0, chamber_pressure);
+    let anions = Mixture::new(&[(1.0, Species::OHNeg)], 300.0, chamber_pressure);
+    let diluent = Mixture::new(&[(38.00, Species::H2O)], 1_000.0, chamber_pressure);
     // TODO seems like raising chamber pressure, increases temperature, which lets
     // me lower theta, which converses more axial velocity!
     let collision_theta_deg = 13.5;
@@ -417,7 +405,6 @@ pub fn sweep_engine() {
     let fixed_total_throat_area = None; // Derive area
     println!("===== Thrust Mode =====");
     calculate_engine_output(
-        &tr,
         voltage,
         collision_theta_deg,
         engine_power,
@@ -429,19 +416,17 @@ pub fn sweep_engine() {
         gap_spacing,
         aperture_diameter,
         funnel_length,
-        t_allowed_max_chamber,
         coupling_efficiency,
         fixed_total_throat_area,
     );
 
-    let diluent = Mixture::new(&vec![(1.0, Species::H2O)], 1_000.0, chamber_pressure);
+    let diluent = Mixture::new(&[(1.0, Species::H2O)], 1_000.0, chamber_pressure);
 
     let collision_theta_deg = 10.0;
     let coupling_efficiency = 0.0025; // Lower because the length of actual plasma in the chamber is less
     // So there is less time for the plasma to couple energy with the diluetnt.
     println!("===== Isp Mode =====");
     calculate_engine_output(
-        &tr,
         voltage,
         collision_theta_deg,
         engine_power,
@@ -453,7 +438,6 @@ pub fn sweep_engine() {
         gap_spacing,
         aperture_diameter,
         funnel_length,
-        t_allowed_max_chamber,
         coupling_efficiency,
         None,
     );

@@ -39,6 +39,6 @@ pub fn exit_pressure_from_area_ratio(
 ) -> f64 {
     let mach_exit = solve_exit_mach(target_area_ratio, gamma);
     let pressure_ratio =
-        (1.0 + mach_exit.powi(2) * (gamma - 1.0) / 2.0).powf(-1.0 * gamma / (gamma - 1.0));
+        (1.0 + mach_exit.powi(2) * (gamma - 1.0) / 2.0).powf(-gamma / (gamma - 1.0));
     chamber_pressure * pressure_ratio
 }

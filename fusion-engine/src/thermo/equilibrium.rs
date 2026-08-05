@@ -2,6 +2,7 @@ use nalgebra::{DMatrix, DVector};
 use std::collections::HashSet;
 use thermo_species::{Constituent, Species};
 
+#[allow(dead_code)]
 pub struct EquilibriumState {
     pub products: Vec<(f64, Species)>,
     pub temperature_k: f64,
@@ -15,6 +16,7 @@ pub enum EquilibriumError {
 }
 
 /// Thermodynamic state specification for equilibrium calculation.
+#[allow(dead_code)]
 pub enum EquilibriumMode {
     /// Fixed temperature and pressure
     TP {
@@ -43,6 +45,7 @@ pub enum EquilibriumMode {
 }
 
 /// Internal debug struct for validation and testing.
+#[allow(dead_code)]
 struct EquilibriumDebug {
     assembled_first_iteration: DMatrix<f64>,
     converged: bool,
@@ -98,22 +101,22 @@ impl MixtureThermo {
             entropy: vec![0.0; ns],
             energy: vec![0.0; ns],
         };
-        for j in 0..ng {
-            out.cp[j] = species[j].data().cp_over_r(temperature_k);
-            out.cv[j] = species[j].data().cp_over_r(temperature_k) - 1.0;
+        for (j, species_j) in species.iter().enumerate().take(ng) {
+            out.cp[j] = species_j.data().cp_over_r(temperature_k);
+            out.cv[j] = species_j.data().cp_over_r(temperature_k) - 1.0;
             // h_over_r/u_over_r return H/R and U/R (Kelvin units, guide A.1);
             // the solver needs the reduced H/(RT) and U/(RT), hence the /T here.
-            out.enthalpy[j] = species[j].data().h_over_r(temperature_k) / temperature_k;
-            out.entropy[j] = species[j].data().s_over_r(temperature_k);
-            out.energy[j] = species[j].data().u_over_r(temperature_k) / temperature_k;
+            out.enthalpy[j] = species_j.data().h_over_r(temperature_k) / temperature_k;
+            out.entropy[j] = species_j.data().s_over_r(temperature_k);
+            out.energy[j] = species_j.data().u_over_r(temperature_k) / temperature_k;
         }
         if include_condensed {
-            for j in ng..(ng + nc) {
-                out.cp[j] = species[j].data().cp_over_r(temperature_k);
-                out.cv[j] = species[j].data().cp_over_r(temperature_k) - 1.0;
-                out.enthalpy[j] = species[j].data().h_over_r(temperature_k) / temperature_k;
-                out.entropy[j] = species[j].data().s_over_r(temperature_k);
-                out.energy[j] = species[j].data().u_over_r(temperature_k) / temperature_k;
+            for (j, species_j) in species.iter().enumerate().skip(ng).take(nc) {
+                out.cp[j] = species_j.data().cp_over_r(temperature_k);
+                out.cv[j] = species_j.data().cp_over_r(temperature_k) - 1.0;
+                out.enthalpy[j] = species_j.data().h_over_r(temperature_k) / temperature_k;
+                out.entropy[j] = species_j.data().s_over_r(temperature_k);
+                out.energy[j] = species_j.data().u_over_r(temperature_k) / temperature_k;
             }
         }
         out
@@ -355,7 +358,7 @@ fn check_condensed_phases(
 // unused_assignments: pi_e's zeroing/accumulation sites mirror CEA's control
 // flow literally (guide H.2's ⚠ note); some are dead under H.3's overwrite,
 // exactly as in the Fortran.
-#[allow(unused_assignments)]
+#[allow(unused_assignments, clippy::too_many_arguments)]
 fn solve_for_products_debug(
     reactants: &[(f64, Species)],
     // Section E.1: which state1/state2 pair this problem fixes. Only 't'
@@ -408,27 +411,26 @@ fn solve_for_products_debug(
                 .any(|(_, constituent_i)| !constituent_set.contains(constituent_i))
         })
         .filter(|&&species_i| only.is_none_or(|list| list.contains(&species_i)))
-        .map(|&species_i| species_i)
+        .copied()
         .collect();
     let mut species: Vec<Species> = possible_species
         .iter()
         .filter(|species_i| species_i.data().phase() == 0)
-        .map(|&species_i| species_i)
+        .copied()
         .collect();
     // Append condensed to the END of the species
     let ng = species.len();
-    let nc;
-    if include_condensed {
+    let nc = if include_condensed {
         species.extend(
             possible_species
                 .iter()
                 .filter(|species_i| species_i.data().phase() > 0)
-                .map(|&species_i| species_i),
+                .copied(),
         );
-        nc = species.len() - ng;
+        species.len() - ng
     } else {
-        nc = 0;
-    }
+        0
+    };
     let constituent_pool = if constituent_set.contains(&Constituent::E) {
         // Remove it temporarily.
         constituent_set.remove(&Constituent::E);
@@ -602,8 +604,8 @@ fn solve_for_products_debug(
                 j_liq = None;
                 times_converged = 0;
                 n = 0.1;
-                for j in 0..ng {
-                    ln_nj[j] = (0.1 / ng as f64).ln();
+                for ln_n_j in ln_nj.iter_mut().take(ng) {
+                    *ln_n_j = (0.1 / ng as f64).ln();
                 }
                 iteration = 0;
                 continue;
@@ -634,7 +636,7 @@ fn solve_for_products_debug(
         // E row into an endless singular-recovery loop.
         let ions_dead = has_electron && !active_ions;
         let active_elements: Vec<usize> = (0..ne)
-            .filter(|&k| !element_excluded[k] && !(ions_dead && k == ne - 1))
+            .filter(|&k| !(element_excluded[k] && (ions_dead && k == ne - 1)))
             .collect();
         let ne_active = active_elements.len();
 
@@ -1378,8 +1380,8 @@ fn solve_for_products_debug(
         if !changed && nc > 0 {
             let mut best: Option<(usize, f64)> = None;
             let mut blocked_wants_in = false;
-            for c in 0..nc {
-                if is_active[c] {
+            for (c, active) in is_active.iter_mut().enumerate().take(nc) {
+                if *active {
                     continue;
                 }
                 let sc = ng + c;
@@ -1795,19 +1797,6 @@ fn element_amounts(reactants: &[(f64, Species)], constituent_pool: &[Constituent
     b0
 }
 
-// state1 for HP problems (Appendix AI.2.6): the reactants' assigned
-// enthalpy at their own reference temperature, divided by R.
-// state1 = Σ_j x_j * H_j(T_init) / (R * Σ_j x_j * M_j)  [kmol*K/kg]
-// h_over_r already returns H_j(T)/R directly (Kelvin units, guide A.1).
-fn reactant_enthalpy_over_r(reactants: &[(f64, Species)], reactant_temperature_k: f64) -> f64 {
-    let total_mass: f64 = reactants.iter().map(|(x, sp)| x * sp.data().mw()).sum();
-    reactants
-        .iter()
-        .map(|(x, sp)| x * sp.data().h_over_r(reactant_temperature_k))
-        .sum::<f64>()
-        / total_mass
-}
-
 #[cfg(test)]
 mod gauss_validation {
     //! Section C validation (CEA_RUST_PORT_GUIDE.md): the guide's suggested
@@ -2063,6 +2052,19 @@ mod e_hp_validation {
     //! numbers because J.1 didn't apply). Both the canonical-guess matrix
     //! AND the converged T/mole fractions are the guide's actual numbers.
     use super::*;
+
+    // state1 for HP problems (Appendix AI.2.6): the reactants' assigned
+    // enthalpy at their own reference temperature, divided by R.
+    // state1 = Σ_j x_j * H_j(T_init) / (R * Σ_j x_j * M_j)  [kmol*K/kg]
+    // h_over_r already returns H_j(T)/R directly (Kelvin units, guide A.1).
+    fn reactant_enthalpy_over_r(reactants: &[(f64, Species)], reactant_temperature_k: f64) -> f64 {
+        let total_mass: f64 = reactants.iter().map(|(x, sp)| x * sp.data().mw()).sum();
+        reactants
+            .iter()
+            .map(|(x, sp)| x * sp.data().h_over_r(reactant_temperature_k))
+            .sum::<f64>()
+            / total_mass
+    }
 
     fn h2_o2_reactants() -> [(f64, Species); 2] {
         let of_ratio = 15.87336;
@@ -2848,6 +2850,19 @@ mod i_postprocess_validation {
     //!      two nearby SV solves (same S) must match the analytic gamma_s at
     //!      the midpoint solve.
     use super::*;
+
+    // state1 for HP problems (Appendix AI.2.6): the reactants' assigned
+    // enthalpy at their own reference temperature, divided by R.
+    // state1 = Σ_j x_j * H_j(T_init) / (R * Σ_j x_j * M_j)  [kmol*K/kg]
+    // h_over_r already returns H_j(T)/R directly (Kelvin units, guide A.1).
+    fn reactant_enthalpy_over_r(reactants: &[(f64, Species)], reactant_temperature_k: f64) -> f64 {
+        let total_mass: f64 = reactants.iter().map(|(x, sp)| x * sp.data().mw()).sum();
+        reactants
+            .iter()
+            .map(|(x, sp)| x * sp.data().h_over_r(reactant_temperature_k))
+            .sum::<f64>()
+            / total_mass
+    }
 
     fn h2_o2_reactants() -> [(f64, Species); 2] {
         let of_ratio = 15.87336;
