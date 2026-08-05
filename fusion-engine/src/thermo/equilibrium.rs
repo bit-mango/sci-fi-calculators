@@ -82,31 +82,41 @@ struct MixtureThermo {
     energy: Vec<f64>,   // U/(R*T) = enthalpy - 1
 }
 
-fn calc_thermo(
-    species: &[Species],
-    temperature_k: f64,
-    ng: usize, // Number of gas species.
-    nc: usize, // Number of condensed species.
-    include_condensed: bool,
-    out: &mut MixtureThermo,
-) {
-    for j in 0..ng {
-        out.cp[j] = species[j].data().cp_over_r(temperature_k);
-        out.cv[j] = species[j].data().cp_over_r(temperature_k) - 1.0;
-        // h_over_r/u_over_r return H/R and U/R (Kelvin units, guide A.1);
-        // the solver needs the reduced H/(RT) and U/(RT), hence the /T here.
-        out.enthalpy[j] = species[j].data().h_over_r(temperature_k) / temperature_k;
-        out.entropy[j] = species[j].data().s_over_r(temperature_k);
-        out.energy[j] = species[j].data().u_over_r(temperature_k) / temperature_k;
-    }
-    if include_condensed {
-        for j in ng..(ng + nc) {
+impl MixtureThermo {
+    pub fn new(
+        species: &[Species],
+        temperature_k: f64,
+        ng: usize, // Number of gas species.
+        nc: usize, // Number of condensed species.
+        include_condensed: bool,
+    ) -> Self {
+        let ns = species.len();
+        let mut out = MixtureThermo {
+            cp: vec![0.0; ns],
+            cv: vec![0.0; ns],
+            enthalpy: vec![0.0; ns],
+            entropy: vec![0.0; ns],
+            energy: vec![0.0; ns],
+        };
+        for j in 0..ng {
             out.cp[j] = species[j].data().cp_over_r(temperature_k);
             out.cv[j] = species[j].data().cp_over_r(temperature_k) - 1.0;
+            // h_over_r/u_over_r return H/R and U/R (Kelvin units, guide A.1);
+            // the solver needs the reduced H/(RT) and U/(RT), hence the /T here.
             out.enthalpy[j] = species[j].data().h_over_r(temperature_k) / temperature_k;
             out.entropy[j] = species[j].data().s_over_r(temperature_k);
             out.energy[j] = species[j].data().u_over_r(temperature_k) / temperature_k;
         }
+        if include_condensed {
+            for j in ng..(ng + nc) {
+                out.cp[j] = species[j].data().cp_over_r(temperature_k);
+                out.cv[j] = species[j].data().cp_over_r(temperature_k) - 1.0;
+                out.enthalpy[j] = species[j].data().h_over_r(temperature_k) / temperature_k;
+                out.entropy[j] = species[j].data().s_over_r(temperature_k);
+                out.energy[j] = species[j].data().u_over_r(temperature_k) / temperature_k;
+            }
+        }
+        out
     }
 }
 
@@ -637,21 +647,7 @@ fn solve_for_products_debug(
             .map(|j| active_ions && stoich[j][ne - 1] != 0.0)
             .collect();
 
-        let mut mixture_thermo: MixtureThermo = MixtureThermo {
-            cp: vec![0.0; ns],
-            cv: vec![0.0; ns],
-            enthalpy: vec![0.0; ns],
-            entropy: vec![0.0; ns],
-            energy: vec![0.0; ns],
-        };
-        calc_thermo(
-            &species,
-            temperature_k,
-            ng,
-            nc,
-            include_condensed,
-            &mut mixture_thermo,
-        );
+        let mixture_thermo = MixtureThermo::new(&species, temperature_k, ng, nc, include_condensed);
 
         // Pressure/volume closure (Global conventions): fixed for const_p
         // problems, otherwise recomputed each iteration from n/T. n counts
@@ -1178,21 +1174,8 @@ fn solve_for_products_debug(
         // new T before returning — needed here so test 6 (entropy, SP) and
         // F.3 (condensed adjustment) read values at the state actually being
         // checked, not the pre-update one still sitting in `mixture_thermo`.
-        let mut mixture_thermo_post = MixtureThermo {
-            cp: vec![0.0; ns],
-            cv: vec![0.0; ns],
-            enthalpy: vec![0.0; ns],
-            entropy: vec![0.0; ns],
-            energy: vec![0.0; ns],
-        };
-        calc_thermo(
-            &species,
-            temperature_k,
-            ng,
-            nc,
-            include_condensed,
-            &mut mixture_thermo_post,
-        );
+        let mixture_thermo_post =
+            MixtureThermo::new(&species, temperature_k, ng, nc, include_condensed);
 
         // D.5: convergence check. Tests that apply: condensed (test 2, only
         // over active species), total moles (test 3, only when const_p —
@@ -1469,14 +1452,7 @@ fn solve_for_products_debug(
     let active_elements: Vec<usize> = (0..ne).filter(|&k| !element_excluded[k]).collect();
     let ne_active = active_elements.len();
 
-    let mut final_thermo = MixtureThermo {
-        cp: vec![0.0; ns],
-        cv: vec![0.0; ns],
-        enthalpy: vec![0.0; ns],
-        entropy: vec![0.0; ns],
-        energy: vec![0.0; ns],
-    };
-    calc_thermo(&species, temperature_k, ng, nc, true, &mut final_thermo);
+    let final_thermo = MixtureThermo::new(&species, temperature_k, ng, nc, include_condensed);
 
     let final_pressure_bar = if const_p {
         state2
