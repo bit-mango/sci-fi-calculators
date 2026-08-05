@@ -630,13 +630,17 @@ fn solve_for_products(
 
         let active_condensed: Vec<usize> = active_ranked.clone();
         let na = active_condensed.len();
-        // NOTE: unlike CEA, the E pseudo-element's row stays in the matrix
-        // when ions die mid-solve — the reseeded ~1e-6 charged species sit
-        // above the tsize truncation threshold and keep evolving, and with
-        // no other element to pin them (e- has none) dropping the charge
-        // balance lets them run away. If the row itself degenerates, G.2(d)
-        // handles it.
-        let active_elements: Vec<usize> = (0..ne).filter(|&k| !element_excluded[k]).collect();
+        // H.3/G.2(d): once ions die, the E pseudo-element's row leaves the
+        // matrix (num_active_elements shrinks from the end). This is only
+        // safe because the dead charged species are simultaneously parked
+        // below LOG_MIN and PINNED (dln_nj forced to 0 below) — an unpinned
+        // charged species with no charge-balance row and no other element
+        // (e-) would grow without bound, and an unparked one re-zeroes the
+        // E row into an endless singular-recovery loop.
+        let ions_dead = has_electron && !active_ions;
+        let active_elements: Vec<usize> = (0..ne)
+            .filter(|&k| !element_excluded[k] && !(ions_dead && k == ne - 1))
+            .collect();
         let ne_active = active_elements.len();
 
         // H.1: is_ion[j] = ions requested, still active, and species j
@@ -1004,7 +1008,7 @@ fn solve_for_products(
             {
                 for j in 0..ng {
                     if stoich[j][ne - 1] != 0.0 {
-                        ln_nj[j] = -13.815511; // SMNOL = ln(1e-6)
+                        ln_nj[j] = -87.3; // below LOG_MIN — see the H.3 parking note
                     }
                 }
                 active_ions = false;
@@ -1043,6 +1047,12 @@ fn solve_for_products(
             // zeroed it into a singular sub-matrix.
             if !changed {
                 for j in 0..ng {
+                    // Dead-ion parking is exempt: re-inflating a pinned
+                    // charged species would put phantom element amounts
+                    // back into the balance sums (see the H.3 parking note).
+                    if has_electron && !active_ions && stoich[j][ne - 1] != 0.0 {
+                        continue;
+                    }
                     if ln_nj[j] < -80.0 {
                         ln_nj[j] = -13.815511; // guide's SMNOL = ln(1e-6)
                     }
@@ -1066,7 +1076,15 @@ fn solve_for_products(
             pi_prev[ne - 1] = 0.0;
             for j in 0..ng {
                 if stoich[j][ne - 1] != 0.0 {
-                    ln_nj[j] = -13.815511; // SMNOL = ln(1e-6)
+                    // Deliberate deviation from the guide's SMNOL (1e-6):
+                    // park BELOW the LOG_MIN reporting cutoff. At 1e-6 a
+                    // parked molecular ion still carries ~1e-6 of its real
+                    // elements into the balance sums — above test 4's
+                    // 1e-6·max(b0) tolerance — so convergence could never
+                    // pass; and once it decays under the truncation
+                    // threshold it re-zeroes the E row into an endless
+                    // singular loop. Parked+pinned at 1e-38 it is inert.
+                    ln_nj[j] = -87.3;
                 }
             }
         }
@@ -1092,6 +1110,12 @@ fn solve_for_products(
         };
         let dln_nj: Vec<f64> = (0..ng)
             .map(|j| {
+                // Live active_ions, not the top-of-iteration ions_dead: the
+                // death check just above may have parked them this same
+                // iteration, and they must not take one last unpinned step.
+                if has_electron && !active_ions && stoich[j][ne - 1] != 0.0 {
+                    return 0.0; // pinned: see the active_elements note above
+                }
                 -mu_g[j]
                     + dln_n
                     + (0..ne).map(|i| stoich[j][i] * pi_prev[i]).sum::<f64>()
@@ -2868,6 +2892,7 @@ mod tp_stability_suite {
         );
     }
 }
+
 
 
 
