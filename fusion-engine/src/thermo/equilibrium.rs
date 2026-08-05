@@ -4,6 +4,10 @@ use thermo_species::{Constituent, Species};
 
 #[allow(dead_code)]
 pub struct EquilibriumState {
+    /// Product amounts in the same mole units as the reactant amounts passed
+    /// to [`solve_for_products`] (element moles are conserved 1:1 between
+    /// input and output). Internally the solver works per kg of mixture;
+    /// the result is rescaled by the reactants' total mass before returning.
     pub products: Vec<(f64, Species)>,
     pub temperature_k: f64,
     pub pressure_bar: f64,
@@ -1701,7 +1705,8 @@ fn solve_for_products_debug(
 /// Public API for computing equilibrium composition.
 ///
 /// # Arguments
-/// * `reactants` - Initial composition as (mass or mole amount, Species) pairs
+/// * `reactants` - Initial composition as (mole amount, Species) pairs;
+///   products come back in these same mole units
 /// * `mode` - Thermodynamic mode specification (TP, HP, SP, TV, UV, or SV)
 /// * `include_condensed` - Include condensed (solid/liquid) species
 /// * `include_ions` - Include ionic species
@@ -1754,17 +1759,24 @@ pub fn solve_for_products(
     );
 
     if debug_result.converged {
+        // The core solver works in CEA's kmol-per-kg basis (numerically
+        // mol/g, with Σ nj·MWj = 1 exactly). Scale by the reactants' total
+        // mass so `products` comes back in the same mole units the caller
+        // used for `reactants`: 1 mol CH4 in gives its carbon back as 1 mol
+        // spread across the products.
+        let input_mass: f64 = reactants.iter().map(|(x, sp)| x * sp.data().mw()).sum();
+
         // Build products list from gas and active condensed species
         let mut products: Vec<(f64, Species)> = debug_result
             .gas_species
             .iter()
             .zip(debug_result.nj.iter())
-            .map(|(&sp, &n)| (n, sp))
+            .map(|(&sp, &n)| (n * input_mass, sp))
             .collect();
 
         for (i, &sp) in debug_result.condensed_species.iter().enumerate() {
             if debug_result.condensed_active[i] {
-                products.push((debug_result.condensed_nj[i], sp));
+                products.push((debug_result.condensed_nj[i] * input_mass, sp));
             }
         }
 
@@ -2000,12 +2012,16 @@ mod d5_convergence_validation {
         .expect("TP solve should converge");
 
         // --- Check 1: element conservation ---
+        // element_amounts is per gram of mixture; products are on the
+        // reactants' mole basis, so scale b0 up by the input mass.
+        let input_mass: f64 = reactants.iter().map(|(x, sp)| x * sp.data().mw()).sum();
         let b0 = element_amounts(&reactants, &[Constituent::H, Constituent::O]);
         for (k, &b0_k) in b0.iter().enumerate() {
             let b_k: f64 = (0..6).map(|j| stoich[j][k] * state.products[j].0).sum();
             assert!(
-                (b0_k - b_k).abs() < 1e-8,
-                "element {k}: b0 = {b0_k}, Σ a_ij*nj = {b_k}"
+                (b0_k * input_mass - b_k).abs() < 1e-8 * input_mass,
+                "element {k}: b0*mass = {}, Σ a_ij*nj = {b_k}",
+                b0_k * input_mass
             );
         }
 
@@ -2226,8 +2242,11 @@ mod e_sp_validation {
             -4.4084879383149573,
             -4.6538971360500030,
         ];
+        // The guide's ln_nj are on CEA's kmol/kg basis; the public API
+        // returns the reactants' mole basis, so convert back before comparing.
+        let input_mass: f64 = reactants.iter().map(|(x, sp)| x * sp.data().mw()).sum();
         for (j, &expected) in expected_ln_nj.iter().enumerate() {
-            let nj = state.products[j].0;
+            let nj = state.products[j].0 / input_mass;
             let got = nj.ln();
             assert!(
                 (got - expected).abs() < 1e-6,

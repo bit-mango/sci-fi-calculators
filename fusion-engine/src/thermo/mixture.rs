@@ -49,6 +49,12 @@ impl Mixture {
             }
             Err(err) => match err {
                 EquilibriumError::FailedToConverge { iterations_used } => {
+                    for (mole, species) in reactants.iter() {
+                        if *mole < 1.0e-6 {
+                            continue;
+                        }
+                        println!("{:.6} {}", mole, species.data().symbol());
+                    }
                     panic!("Failed to converge in {} iterations!", iterations_used);
                 }
             },
@@ -76,7 +82,7 @@ impl Mixture {
         }
     }
 
-    fn state(
+    pub fn state(
         products: &[(f64, Species)],
         temperature_k: f64,
         pressure_bar: f64,
@@ -99,6 +105,11 @@ impl Mixture {
         let s_total: f64 = products
             .iter()
             .map(|(n_i, species_i, x_i)| {
+                // Extinct species are reported with exactly 0 moles; skip
+                // them or 0 * ln(0) poisons the sum with NaN.
+                if *n_i <= 0.0 {
+                    return 0.0;
+                }
                 n_i * (species_i.data().s(temperature_k)
                     - R * (x_i * pressure_bar / STD_REFERENCE_PRESSURE).ln())
             })
@@ -123,68 +134,6 @@ impl Mixture {
             }
             println!("{:.6} {}", mole, species.data().symbol());
         }
-    }
-
-    pub fn solve_for_target_enthalpy(&self, target_enthalpy: f64) -> Mixture {
-        // Find a bracket where f(T) = h(T) - starting_h changes sign
-        let step = 500.0;
-        // Walk down from the hot temperature.
-        let mut t_low = self.temperature_k;
-        let mut low_scratch = Mixture::new(&self.products, t_low, self.pressure_bar);
-        let mut f_low = low_scratch.h_total - target_enthalpy;
-        while f_low > 0.0 && t_low > 200.0 {
-            let next_t = (t_low - step).max(200.0);
-            low_scratch = Mixture::new(&low_scratch.products, next_t, self.pressure_bar);
-            t_low = next_t;
-            f_low = low_scratch.h_total - target_enthalpy;
-        }
-        // Walk up from the hot temperature.
-        let mut t_high = self.temperature_k;
-        let mut high_scratch = Mixture::new(&self.products, t_high, self.pressure_bar);
-        let mut f_high = high_scratch.h_total - target_enthalpy;
-        while f_high < 0.0 && t_high < 20_000.0 {
-            let next_t = (t_high + step).min(20_000.0);
-            high_scratch = Mixture::new(&high_scratch.products, next_t, self.pressure_bar);
-            t_high = next_t;
-            f_high = high_scratch.h_total - target_enthalpy;
-        }
-
-        if f_low > 0.0 || f_high < 0.0 {
-            println!("Temperature Range: {:.3} <-> {:.3}", t_low, t_high);
-            panic!("Could not bracket adiabatic mix temperature");
-        }
-
-        // Now determine actual new mix
-        let mut t = t_low + (t_high - t_low) / 2.0;
-        let mut iterations = 0;
-        let mut final_products = None;
-        while iterations < 100 {
-            if (t_high - t_low).abs() < 1.0e-6 {
-                final_products = Some(low_scratch);
-                break;
-            }
-            let seed = if (t - t_low).abs() <= (t_high - t).abs() {
-                &low_scratch.products
-            } else {
-                &high_scratch.products
-            };
-            let mid_scratch = Mixture::new(seed, t, self.pressure_bar);
-            let f_mid = mid_scratch.h_total - target_enthalpy;
-
-            if f_mid < 0.0 {
-                // Raise temperature
-                t_low = t;
-                low_scratch = mid_scratch;
-            } else {
-                // Lower temperature
-                t_high = t;
-                high_scratch = mid_scratch;
-            }
-            t = t_low + (t_high - t_low) / 2.0;
-            iterations += 1;
-        }
-
-        final_products.expect("Failed to mix products")
     }
 
     pub fn mix(&self, other: &Self) -> Self {
@@ -233,8 +182,43 @@ impl Mixture {
             .collect::<Vec<(f64, Species)>>();
         reactants.sort_by_key(|a| a.1);
 
-        let combined = Mixture::new(&reactants, hot.temperature_k, pressure_bar);
-        combined.solve_for_target_enthalpy(starting_h)
+        // Use HP mode to reequilibrate at the combined enthalpy and pressure.
+        // This allows species to dissociate/recombine as needed (e.g., H2O → H2 + O, etc.).
+        // starting_h is in J; HP mode wants H/R per unit feed mass [K·mol/g].
+        let feed_mass: f64 = reactants.iter().map(|(n, s)| n * s.data().mw()).sum();
+        let result = solve_for_products(
+            &reactants,
+            EquilibriumMode::HP {
+                h_over_r: starting_h / (R * feed_mass),
+                pressure_bar,
+            },
+            true,
+            true,
+            None,
+        );
+
+        match result {
+            Ok(state) => {
+                let (h_total, s_total, n_total, avg_mw, avg_cp) =
+                    Self::state(&state.products, state.temperature_k, state.pressure_bar);
+
+                Self {
+                    products: state.products,
+                    temperature_k: state.temperature_k,
+                    pressure_bar: state.pressure_bar,
+                    h_total,
+                    s_total,
+                    n_total,
+                    avg_mw,
+                    avg_cp,
+                }
+            }
+            Err(err) => match err {
+                EquilibriumError::FailedToConverge { iterations_used } => {
+                    panic!("mix() failed to converge after {} iterations", iterations_used)
+                }
+            },
+        }
     }
 
     pub fn scale(&self, factor: f64) -> Self {
@@ -253,3 +237,6 @@ impl Mixture {
             .sum()
     }
 }
+
+
+
