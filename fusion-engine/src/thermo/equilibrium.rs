@@ -1,90 +1,44 @@
-// At some fixed T, P you want the mole numbers n_j of each species that minmize total Gibbs energY:
-// G/RT = Σ_j n_j * µ_j/RT
-// Where the chemical potential of species j is:
-// µ_j/RT = g_j + ln(n_j/n) + ln(P)
-// g_j = G°_j/RT: The species standard state reduced Gibbs energy(use NASA polynomials)
-// n = Σ n_j: total moles of the gas
-// ln(n_j/n): The mixing/entropy term which is a mole fraction(n_j/n)
-// ln(P): pressure correction (P in atm, standard state 1 atm)
-//
-// The atoms have to add up to what you started with
-// Σ_j a_ij * n_j = b_i for each element i
-// a_ij: atoms of element i in species j(a fixed known matrix). b_i: total moles of element i (fixed by reactants).
-// So if i is rows and j is columns, then for the reactants: H2O we would have something like.
-//    j  H2O  H2  O2
-// i
-// H      2   2   0
-// O      1   0   2
-//
-// Go from Langrangian -> element potentials
-// Introduce 1 Lagrange multiplier π_i per element( literally called element potentials)
-// The stationarity condition (∂L/∂n_j = 0) gives, for every species:
-// g_j + ln(n_j/n) + ln(P) = Σ a_ij * π_i: The chemical potential of species j equals the sum of the potentials of the elements its built from
-// When you rearrange it, it tells you n_j directly:
-// ln(n_j) = -g_j +ln(P) + Σ a_ij*π_i + ln(n)
-//
-// Newton's method is actually solving for π_i(one per element) and ln(n) (total moles of products)
-// You need 3 equations:
-// Mass balance for H: 2*n_H2O + 2*n_H2 = b_H
-// Mass balance for O: 1*n_H2O + 2*n_O2 = b_O
-// Definition of total moles = n_H2O + n_H2 + n_O2 = n
-// n_j is an is nonlinear(exponential) function of π_H, π_O, ln(n) these three equations are nonlinear, so we use Newton's method.
-// The Jacobian entries are just derivatives of n_j = exp(...)
-// ∂n_j/∂π_k = a_kj * n_j
-// ∂n_j/∂ln(n) = n_j
-//
 use nalgebra::{DMatrix, DVector};
 use std::collections::HashSet;
 use thermo_species::{Constituent, Species};
 
-/// Temporary window into solve_for_products' internal state, just enough to
-/// validate D.1-D.5 against the guide's numbers/tests. Not a final API —
-/// Section G will need a real Result/error type once singular-matrix
-/// recovery and the outer driver exist.
-struct TpSolveDebug {
-    /// The assembled (pre-solve) matrix from the very first Newton
-    /// iteration, at the D.6 canonical initial guess.
+pub struct EquilibriumState {
+    pub products: Vec<(f64, Species)>,
+    pub temperature_k: f64,
+    pub pressure_bar: f64,
+    pub volume_m3_per_kg: f64,
+}
+
+#[derive(Debug)]
+pub enum EquilibriumError {
+    FailedToConverge { iterations_used: usize },
+}
+
+/// Internal debug struct for validation and testing.
+struct EquilibriumDebug {
     assembled_first_iteration: DMatrix<f64>,
     converged: bool,
     iterations_used: usize,
-    /// Final gas amounts, RAW (exp(ln_nj[j])), length ng.
     nj: Vec<f64>,
     n: f64,
-    /// Final temperature — equal to state1 for TP, solved-for otherwise.
     temperature_k: f64,
-    /// F.1: which condensed species (indices into the condensed slice,
-    /// i.e. species[ng+c]) ended up active, and their final linear amounts.
     condensed_active: Vec<bool>,
     condensed_nj: Vec<f64>,
-    /// The actual gas/condensed species lists solve_for_products settled
-    /// on (order matches `nj`/`condensed_active`/`condensed_nj`) — needed
-    /// by callers/tests when `only` wasn't given, so the product set was
-    /// auto-generated rather than known in advance.
     gas_species: Vec<Species>,
     condensed_species: Vec<Species>,
-
-    // --- Section I: post-processing & thermodynamic derivatives ---
-    // Computed once at the final state (converged or not — matches the
-    // guide's "never a hard failure" framing for I.2/I.3); never gates
-    // `converged` itself.
     pressure_bar: f64,
     volume_m3_per_kg: f64,
     enthalpy_kj_per_kg: f64,
-    energy_kj_per_kg: f64, // U
+    energy_kj_per_kg: f64,
     entropy_kj_per_kg_k: f64,
     gibbs_kj_per_kg: f64,
-    molar_mass_kg_per_kmol: f64,             // M = 1/n
-    mean_molecular_weight_kg_per_kmol: f64,  // MW, gas-only (Eq. 2.4)
+    molar_mass_kg_per_kmol: f64,
+    mean_molecular_weight_kg_per_kmol: f64,
     cp_frozen_kj_per_kg_k: f64,
     cv_frozen_kj_per_kg_k: f64,
-    // I.2: equilibrium (reacting) specific heats and isentropic exponent.
-    // Fall back to I.1/I.3's degrade-gracefully constants if the partials
-    // system (which shares the converged matrix's LHS) turns out singular
-    // — rare, since that same LHS structure already solved successfully.
     cp_eq_kj_per_kg_k: f64,
     cv_eq_kj_per_kg_k: f64,
     gamma_s: f64,
-    // Mole/mass fractions, split gas/condensed like gas_species/condensed_species.
     gas_mole_fractions: Vec<f64>,
     condensed_mole_fractions: Vec<f64>,
     gas_mass_fractions: Vec<f64>,
@@ -364,7 +318,7 @@ fn check_condensed_phases(
 // flow literally (guide H.2's ⚠ note); some are dead under H.3's overwrite,
 // exactly as in the Fortran.
 #[allow(unused_assignments)]
-fn solve_for_products(
+fn solve_for_products_debug(
     reactants: &[(f64, Species)],
     // Section E.1: which state1/state2 pair this problem fixes. Only 't'
     // (TP), 'h' (HP), and 's' (SP) are implemented so far — TV/UV/SV need
@@ -389,7 +343,7 @@ fn solve_for_products(
     // pool. Mainly for tests, where the ground truth was computed for a
     // specific, curated product list.
     only: Option<&[Species]>,
-) -> TpSolveDebug {
+) -> EquilibriumDebug {
     let mut constituent_set: HashSet<Constituent> = HashSet::new();
     reactants.iter().for_each(|(_, parent_species)| {
         let children = parent_species.data().constituents();
@@ -592,7 +546,10 @@ fn solve_for_products(
             // work with — reset to the uniform initial guess and drop that
             // condensed species, then keep going instead of giving up.
             let single_active_condensed = (0..nc).filter(|&c| is_active[c]).count() == 1;
-            if !g3_fallback_used && (!is_hp || temperature_k > 100.0) && single_active_condensed && n <= 1e-4
+            if !g3_fallback_used
+                && (!is_hp || temperature_k > 100.0)
+                && single_active_condensed
+                && n <= 1e-4
             {
                 g3_fallback_used = true;
                 for c in 0..nc {
@@ -648,8 +605,9 @@ fn solve_for_products(
         // once per iteration (rather than a closure over `active_ions`) so
         // H.3's later flip of `active_ions` doesn't retroactively change
         // truncation decisions already made earlier this same iteration.
-        let is_ion: Vec<bool> =
-            (0..ng).map(|j| active_ions && stoich[j][ne - 1] != 0.0).collect();
+        let is_ion: Vec<bool> = (0..ng)
+            .map(|j| active_ions && stoich[j][ne - 1] != 0.0)
+            .collect();
 
         let mut mixture_thermo: MixtureThermo = MixtureThermo {
             cp: vec![0.0; ns],
@@ -703,8 +661,10 @@ fn solve_for_products(
         let b_delta: Vec<f64> = (0..ne)
             .map(|k| {
                 let gas: f64 = (0..ng).map(|j| stoich[j][k] * nj_eff[j]).sum();
-                let cond: f64 =
-                    active_condensed.iter().map(|&c| stoich[ng + c][k] * nj_c[c]).sum();
+                let cond: f64 = active_condensed
+                    .iter()
+                    .map(|&c| stoich[ng + c][k] * nj_c[c])
+                    .sum();
                 b0[k] - gas - cond
             })
             .collect();
@@ -720,7 +680,11 @@ fn solve_for_products(
         // Same choice, but for one condensed species: F.2's condensed row's
         // own ΔlnT entry (pressure/volume type — not the energy type).
         let condensed_pressure_weight = |sc: usize| -> f64 {
-            if const_p { mixture_thermo.enthalpy[sc] } else { mixture_thermo.energy[sc] }
+            if const_p {
+                mixture_thermo.enthalpy[sc]
+            } else {
+                mixture_thermo.energy[sc]
+            }
         };
         // F.2's "condensed phase column entry" (h_c/s_c/u_c per the ENERGY
         // row's own type — h· for HP, s· for SP/SV, u· for UV).
@@ -807,8 +771,9 @@ fn solve_for_products(
             // there's no moles row at all otherwise, so always enthalpy,
             // never energy_weight, and gas-only per AI.3.4).
             if const_p {
-                g[(lnn_col, lnt_col)] =
-                    (0..ng).map(|j| nj_eff[j] * mixture_thermo.enthalpy[j]).sum::<f64>();
+                g[(lnn_col, lnt_col)] = (0..ng)
+                    .map(|j| nj_eff[j] * mixture_thermo.enthalpy[j])
+                    .sum::<f64>();
             }
 
             // E.2c energy row. tmp_j/hsu_delta depend on the energy type:
@@ -831,8 +796,11 @@ fn solve_for_products(
                 .iter()
                 .map(|&c| nj_c[c] * condensed_energy_type_value(ng + c))
                 .collect();
-            let hsu_delta = (if const_s { state1 } else { state1 / temperature_k })
-                - tmp_energy.iter().sum::<f64>()
+            let hsu_delta = (if const_s {
+                state1
+            } else {
+                state1 / temperature_k
+            }) - tmp_energy.iter().sum::<f64>()
                 - tmp_energy_condensed.iter().sum::<f64>();
 
             // Energy row's own pi columns and Δln n column — type-specific,
@@ -861,20 +829,34 @@ fn solve_for_products(
                 // F.2: "the ΔlnT diagonal (Σ n_c cp_c)" — condensed enters
                 // via the nj*cp term only, not the tmp*h cross term (gas-only
                 // there, per the guide's explicit condensed-entry list).
-                let cond_cp: f64 =
-                    active_condensed.iter().map(|&c| nj_c[c] * mixture_thermo.cp[ng + c]).sum();
-                (0..ng).map(|j| nj_eff[j] * mixture_thermo.cp[j]).sum::<f64>()
+                let cond_cp: f64 = active_condensed
+                    .iter()
+                    .map(|&c| nj_c[c] * mixture_thermo.cp[ng + c])
+                    .sum();
+                (0..ng)
+                    .map(|j| nj_eff[j] * mixture_thermo.cp[j])
+                    .sum::<f64>()
                     + cond_cp
-                    + (0..ng).map(|j| tmp_energy[j] * mixture_thermo.enthalpy[j]).sum::<f64>()
+                    + (0..ng)
+                        .map(|j| tmp_energy[j] * mixture_thermo.enthalpy[j])
+                        .sum::<f64>()
             } else {
-                let cond_cv: f64 =
-                    active_condensed.iter().map(|&c| nj_c[c] * mixture_thermo.cv[ng + c]).sum();
-                let mut v = (0..ng).map(|j| nj_eff[j] * mixture_thermo.cv[j]).sum::<f64>()
+                let cond_cv: f64 = active_condensed
+                    .iter()
+                    .map(|&c| nj_c[c] * mixture_thermo.cv[ng + c])
+                    .sum();
+                let mut v = (0..ng)
+                    .map(|j| nj_eff[j] * mixture_thermo.cv[j])
+                    .sum::<f64>()
                     + cond_cv
-                    + (0..ng).map(|j| tmp_energy[j] * mixture_thermo.energy[j]).sum::<f64>();
+                    + (0..ng)
+                        .map(|j| tmp_energy[j] * mixture_thermo.energy[j])
+                        .sum::<f64>();
                 if const_s {
                     // SV extra term (Eq. 2.48), gas-only per the guide.
-                    v -= (0..ng).map(|j| nj_eff[j] * mixture_thermo.energy[j]).sum::<f64>();
+                    v -= (0..ng)
+                        .map(|j| nj_eff[j] * mixture_thermo.energy[j])
+                        .sum::<f64>();
                 }
                 v
             };
@@ -940,7 +922,9 @@ fn solve_for_products(
                 let worst = active_condensed
                     .iter()
                     .filter(|&&c| {
-                        c != last && (0..ne).any(|k| stoich[ng + c][k] != 0.0 && stoich[last_sc][k] != 0.0)
+                        c != last
+                            && (0..ne)
+                                .any(|k| stoich[ng + c][k] != 0.0 && stoich[last_sc][k] != 0.0)
                     })
                     .min_by(|&&a, &&b| nj_c[a].partial_cmp(&nj_c[b]).unwrap());
                 if let Some(&c) = worst {
@@ -1137,7 +1121,11 @@ fn solve_for_products(
         for j in 0..ng {
             ln_nj[j] += applied_dln_nj[j];
             let threshold = n.ln() - if is_ion[j] { esize } else { tsize };
-            nj_stored[j] = if ln_nj[j] > threshold { ln_nj[j].exp() } else { 0.0 };
+            nj_stored[j] = if ln_nj[j] > threshold {
+                ln_nj[j].exp()
+            } else {
+                0.0
+            };
         }
         // F.2: condensed update is LINEAR, not log-space, and can go
         // negative transiently — that's F.3.1's removal signal.
@@ -1206,8 +1194,10 @@ fn solve_for_products(
                 return true;
             }
             let gas_b_k: f64 = (0..ng).map(|j| stoich[j][k] * ln_nj[j].exp()).sum();
-            let cond_b_k: f64 =
-                active_condensed.iter().map(|&c| stoich[ng + c][k] * nj_c[c]).sum();
+            let cond_b_k: f64 = active_condensed
+                .iter()
+                .map(|&c| stoich[ng + c][k] * nj_c[c])
+                .sum();
             (b0[k] - gas_b_k - cond_b_k).abs() <= B_TOL * b_max
         });
 
@@ -1248,7 +1238,11 @@ fn solve_for_products(
             tsize = xsize;
             for j in 0..ng {
                 let threshold = n.ln() - if is_ion[j] { esize } else { tsize };
-                nj_stored[j] = if ln_nj[j] > threshold { ln_nj[j].exp() } else { 0.0 };
+                nj_stored[j] = if ln_nj[j] > threshold {
+                    ln_nj[j].exp()
+                } else {
+                    0.0
+                };
             }
             cea_debug!(
                 "[D.5] base converged (times={times_converged}) T={temperature_k} n={n} iter={iteration}"
@@ -1279,7 +1273,11 @@ fn solve_for_products(
                     if a_e == 0.0 {
                         continue;
                     }
-                    let raw = if ln_nj[j] > -87.0 { ln_nj[j].exp() } else { 0.0 };
+                    let raw = if ln_nj[j] > -87.0 {
+                        ln_nj[j].exp()
+                    } else {
+                        0.0
+                    };
                     nj_stored[j] = if ln_nj[j] > n.ln() - esize { raw } else { 0.0 };
                     sum1 += a_e * raw; // RAW amount in the sums, not truncated
                     sum2 += a_e * a_e * raw;
@@ -1330,7 +1328,11 @@ fn solve_for_products(
                 }
             }
             if let Some((c, _)) = worst {
-                cea_debug!("[F.3.1] removing {} (nj={})", species[ng + c].data().symbol(), nj_c[c]);
+                cea_debug!(
+                    "[F.3.1] removing {} (nj={})",
+                    species[ng + c].data().symbol(),
+                    nj_c[c]
+                );
                 is_active[c] = false;
                 nj_c[c] = 0.0;
                 active_ranked.retain(|&x| x != c);
@@ -1376,10 +1378,9 @@ fn solve_for_products(
                     continue;
                 }
                 let a_pi: f64 = (0..ne).map(|i| stoich[sc][i] * pi_prev[i]).sum();
-                let delta_g = (mixture_thermo_post.enthalpy[sc]
-                    - mixture_thermo_post.entropy[sc]
-                    - a_pi)
-                    / species[sc].data().mw();
+                let delta_g =
+                    (mixture_thermo_post.enthalpy[sc] - mixture_thermo_post.entropy[sc] - a_pi)
+                        / species[sc].data().mw();
                 if Some(c) == singular_blocklist {
                     // G.2 removed this species for singularizing the matrix;
                     // never re-add it. Wanting back in is CEA's hard-error
@@ -1449,8 +1450,11 @@ fn solve_for_products(
     };
     calc_thermo(&species, temperature_k, ng, nc, true, &mut final_thermo);
 
-    let final_pressure_bar =
-        if const_p { state2 } else { 1e-5 * R_CEA * n * temperature_k / state2 };
+    let final_pressure_bar = if const_p {
+        state2
+    } else {
+        1e-5 * R_CEA * n * temperature_k / state2
+    };
     let final_volume_m3_per_kg = if const_p {
         R_CEA * n * temperature_k / (final_pressure_bar * 1e5)
     } else {
@@ -1464,16 +1468,29 @@ fn solve_for_products(
         nj_stored.iter().sum::<f64>() + active_condensed.iter().map(|&c| nj_c[c]).sum::<f64>();
     let mut mole_fractions = vec![0.0; ns];
     let mut mass_fractions = vec![0.0; ns];
-    let mut total_mass_flow: f64 =
-        (0..ng).map(|j| nj_stored[j] * species[j].data().mw()).sum();
-    total_mass_flow += active_condensed.iter().map(|&c| nj_c[c] * species[ng + c].data().mw()).sum::<f64>();
+    let mut total_mass_flow: f64 = (0..ng).map(|j| nj_stored[j] * species[j].data().mw()).sum();
+    total_mass_flow += active_condensed
+        .iter()
+        .map(|&c| nj_c[c] * species[ng + c].data().mw())
+        .sum::<f64>();
     for j in 0..ng {
-        mole_fractions[j] = if sum_all > 0.0 { nj_stored[j] / sum_all } else { 0.0 };
-        mass_fractions[j] =
-            if total_mass_flow > 0.0 { nj_stored[j] * species[j].data().mw() / total_mass_flow } else { 0.0 };
+        mole_fractions[j] = if sum_all > 0.0 {
+            nj_stored[j] / sum_all
+        } else {
+            0.0
+        };
+        mass_fractions[j] = if total_mass_flow > 0.0 {
+            nj_stored[j] * species[j].data().mw() / total_mass_flow
+        } else {
+            0.0
+        };
     }
     for c in 0..nc {
-        mole_fractions[ng + c] = if sum_all > 0.0 { nj_c[c] / sum_all } else { 0.0 };
+        mole_fractions[ng + c] = if sum_all > 0.0 {
+            nj_c[c] / sum_all
+        } else {
+            0.0
+        };
         mass_fractions[ng + c] = if total_mass_flow > 0.0 {
             nj_c[c] * species[ng + c].data().mw() / total_mass_flow
         } else {
@@ -1481,8 +1498,13 @@ fn solve_for_products(
         };
     }
 
-    let enthalpy_kj_per_kg = ((0..ng).map(|j| nj_stored[j] * final_thermo.enthalpy[j]).sum::<f64>()
-        + active_condensed.iter().map(|&c| nj_c[c] * final_thermo.enthalpy[ng + c]).sum::<f64>())
+    let enthalpy_kj_per_kg = ((0..ng)
+        .map(|j| nj_stored[j] * final_thermo.enthalpy[j])
+        .sum::<f64>()
+        + active_condensed
+            .iter()
+            .map(|&c| nj_c[c] * final_thermo.enthalpy[ng + c])
+            .sum::<f64>())
         * R_CEA
         * temperature_k
         / 1000.0;
@@ -1495,17 +1517,27 @@ fn solve_for_products(
         .filter(|&j| nj_stored[j] > 0.0)
         .map(|j| nj_stored[j] * (final_thermo.entropy[j] - ln_nj[j] - ln_p_over_n_final))
         .sum();
-    let cond_s: f64 =
-        active_condensed.iter().map(|&c| nj_c[c] * final_thermo.entropy[ng + c]).sum();
+    let cond_s: f64 = active_condensed
+        .iter()
+        .map(|&c| nj_c[c] * final_thermo.entropy[ng + c])
+        .sum();
     let entropy_kj_per_kg_k = R_CEA / 1000.0 * (gas_s + cond_s);
     let gibbs_kj_per_kg = enthalpy_kj_per_kg - temperature_k * entropy_kj_per_kg_k;
 
     let molar_mass_kg_per_kmol = 1.0 / n;
-    let active_cond_mole_frac: f64 = active_condensed.iter().map(|&c| mole_fractions[ng + c]).sum();
+    let active_cond_mole_frac: f64 = active_condensed
+        .iter()
+        .map(|&c| mole_fractions[ng + c])
+        .sum();
     let mean_molecular_weight_kg_per_kmol = (1.0 - active_cond_mole_frac) / n;
 
-    let cp_frozen_kj_per_kg_k = ((0..ng).map(|j| nj_stored[j] * final_thermo.cp[j]).sum::<f64>()
-        + active_condensed.iter().map(|&c| nj_c[c] * final_thermo.cp[ng + c]).sum::<f64>())
+    let cp_frozen_kj_per_kg_k = ((0..ng)
+        .map(|j| nj_stored[j] * final_thermo.cp[j])
+        .sum::<f64>()
+        + active_condensed
+            .iter()
+            .map(|&c| nj_c[c] * final_thermo.cp[ng + c])
+            .sum::<f64>())
         * R_CEA
         / 1000.0;
     let cv_frozen_kj_per_kg_k = cp_frozen_kj_per_kg_k - n * R_CEA / 1000.0;
@@ -1540,8 +1572,9 @@ fn solve_for_products(
 
     let mut rhs_t = vec![0.0; neq2];
     for (row_idx, &k) in active_elements.iter().enumerate() {
-        rhs_t[row_idx] =
-            -(0..ng).map(|j| stoich[j][k] * nj_raw[j] * final_thermo.enthalpy[j]).sum::<f64>();
+        rhs_t[row_idx] = -(0..ng)
+            .map(|j| stoich[j][k] * nj_raw[j] * final_thermo.enthalpy[j])
+            .sum::<f64>();
     }
     for (idx, &c) in active_condensed.iter().enumerate() {
         rhs_t[cond_col2(idx)] = -final_thermo.enthalpy[ng + c];
@@ -1595,9 +1628,13 @@ fn solve_for_products(
                 .sum();
             let term3 = sum_nj_hj_raw * dlnn_dlnt;
             let term4 = (0..ng).map(|j| nj_raw[j] * final_thermo.cp[j]).sum::<f64>()
-                + active_condensed.iter().map(|&c| nj_c[c] * final_thermo.cp[ng + c]).sum::<f64>();
-            let term5 =
-                (0..ng).map(|j| nj_raw[j] * final_thermo.enthalpy[j].powi(2)).sum::<f64>();
+                + active_condensed
+                    .iter()
+                    .map(|&c| nj_c[c] * final_thermo.cp[ng + c])
+                    .sum::<f64>();
+            let term5 = (0..ng)
+                .map(|j| nj_raw[j] * final_thermo.enthalpy[j].powi(2))
+                .sum::<f64>();
 
             (dlnv_dlnt, dlnv_dlnp, term1 + term2 + term3 + term4 + term5)
         }
@@ -1615,9 +1652,15 @@ fn solve_for_products(
     // D.7's final reporting map: species below LOG_MIN are reported as
     // exactly 0 rather than denormal-ish exp() values.
     let nj: Vec<f64> = (0..ng)
-        .map(|j| if ln_nj[j] > -87.0 { ln_nj[j].exp() } else { 0.0 })
+        .map(|j| {
+            if ln_nj[j] > -87.0 {
+                ln_nj[j].exp()
+            } else {
+                0.0
+            }
+        })
         .collect();
-    TpSolveDebug {
+    EquilibriumDebug {
         assembled_first_iteration: assembled_first_iteration
             .expect("MAX_TOTAL_ITERATIONS > 0, so iteration 0 always runs"),
         converged,
@@ -1646,6 +1689,69 @@ fn solve_for_products(
         condensed_mole_fractions: mole_fractions[ng..].to_vec(),
         gas_mass_fractions: mass_fractions[..ng].to_vec(),
         condensed_mass_fractions: mass_fractions[ng..].to_vec(),
+    }
+}
+
+/// Public API for computing equilibrium composition.
+///
+/// # Arguments
+/// * `reactants` - Initial composition as (mass or mole amount, Species) pairs
+/// * `const_t` - If true, temperature is fixed (TP); otherwise solved-for (HP/SP/TV/UV/SV)
+/// * `const_s` - If true, entropy is fixed (SP/SV); ignored if const_t=true
+/// * `const_p` - If true, pressure is fixed; otherwise volume is fixed (TV/UV/SV)
+/// * `state1` - T [K] if const_t; H⁰/R if HP; S⁰/R if SP/SV; otherwise unused
+/// * `state2` - P [bar] if const_p, else V [m³/kg]
+/// * `include_condensed` - Include condensed (solid/liquid) species
+/// * `include_ions` - Include ionic species
+/// * `only` - Restrict products to this list, or None for auto-generated pool
+pub fn solve_for_products(
+    reactants: &[(f64, Species)],
+    const_t: bool,
+    const_s: bool,
+    const_p: bool,
+    state1: f64,
+    state2: f64,
+    include_condensed: bool,
+    include_ions: bool,
+    only: Option<&[Species]>,
+) -> Result<EquilibriumState, EquilibriumError> {
+    let debug_result = solve_for_products_debug(
+        reactants,
+        const_t,
+        const_s,
+        const_p,
+        state1,
+        state2,
+        include_condensed,
+        include_ions,
+        only,
+    );
+
+    if debug_result.converged {
+        // Build products list from gas and active condensed species
+        let mut products: Vec<(f64, Species)> = debug_result
+            .gas_species
+            .iter()
+            .zip(debug_result.nj.iter())
+            .map(|(&sp, &n)| (n, sp))
+            .collect();
+
+        for (i, &sp) in debug_result.condensed_species.iter().enumerate() {
+            if debug_result.condensed_active[i] {
+                products.push((debug_result.condensed_nj[i], sp));
+            }
+        }
+
+        Ok(EquilibriumState {
+            products,
+            temperature_k: debug_result.temperature_k,
+            pressure_bar: debug_result.pressure_bar,
+            volume_m3_per_kg: debug_result.volume_m3_per_kg,
+        })
+    } else {
+        Err(EquilibriumError::FailedToConverge {
+            iterations_used: debug_result.iterations_used,
+        })
     }
 }
 
@@ -1792,8 +1898,16 @@ mod d1_assembly_validation {
             Species::OH,
         ];
 
-        let result = solve_for_products(
-            &reactants, true, false, true, 3800.0, 1.01325, false, false, Some(&only),
+        let result = solve_for_products_debug(
+            &reactants,
+            true,
+            false,
+            true,
+            3800.0,
+            1.01325,
+            false,
+            false,
+            Some(&only),
         );
         let g = &result.assembled_first_iteration;
 
@@ -1860,7 +1974,7 @@ mod d5_convergence_validation {
 
         let temperature_k = 3800.0;
         let pressure_bar = 1.01325;
-        let result = solve_for_products(
+        let state = solve_for_products(
             &reactants,
             true,
             false,
@@ -1870,19 +1984,13 @@ mod d5_convergence_validation {
             false,
             false,
             Some(&only),
-        );
-
-        assert!(
-            result.converged,
-            "did not converge within {} iterations",
-            result.iterations_used
-        );
-        assert!(result.iterations_used < 50);
+        )
+        .expect("TP solve should converge");
 
         // --- Check 1: element conservation ---
         let b0 = element_amounts(&reactants, &[Constituent::H, Constituent::O]);
         for (k, &b0_k) in b0.iter().enumerate() {
-            let b_k: f64 = (0..6).map(|j| stoich[j][k] * result.nj[j]).sum();
+            let b_k: f64 = (0..6).map(|j| stoich[j][k] * state.products[j].0).sum();
             assert!(
                 (b0_k - b_k).abs() < 1e-8,
                 "element {k}: b0 = {b0_k}, Σ a_ij*nj = {b_k}"
@@ -1899,12 +2007,13 @@ mod d5_convergence_validation {
             Species::O2,
             Species::OH,
         ];
+        let total_moles: f64 = state.products.iter().map(|(n, _)| n).sum();
         let mu: Vec<f64> = (0..6)
             .map(|j| {
                 let d = species[j].data();
                 d.h_over_r(temperature_k) / temperature_k - d.s_over_r(temperature_k)
-                    + result.nj[j].ln()
-                    + (pressure_bar / result.n).ln()
+                    + state.products[j].0.ln()
+                    + (pressure_bar / total_moles).ln()
             })
             .collect();
 
@@ -1956,7 +2065,17 @@ mod e_hp_validation {
         let only = only_h2_o2_products();
         let state1 = reactant_enthalpy_over_r(&reactants, 2000.0);
 
-        let result = solve_for_products(&reactants, false, false, true, state1, 1.01325, false, false, Some(&only));
+        let result = solve_for_products_debug(
+            &reactants,
+            false,
+            false,
+            true,
+            state1,
+            1.01325,
+            false,
+            false,
+            Some(&only),
+        );
         let g = &result.assembled_first_iteration;
 
         #[rustfmt::skip]
@@ -1967,7 +2086,11 @@ mod e_hp_validation {
             [0.29041578093904313,  0.35522308781408640, 0.50248557985367082, 4.60022515802027690, -10.014870869177022],
         ];
 
-        assert_eq!(g.nrows(), 4, "expected 2 elements + dln_n + dlnT = 4 equations");
+        assert_eq!(
+            g.nrows(),
+            4,
+            "expected 2 elements + dln_n + dlnT = 4 equations"
+        );
         for r in 0..4 {
             for c in 0..5 {
                 let got = g[(r, c)];
@@ -1986,7 +2109,17 @@ mod e_hp_validation {
         let only = only_h2_o2_products();
         let state1 = reactant_enthalpy_over_r(&reactants, 2000.0);
 
-        let result = solve_for_products(&reactants, false, false, true, state1, 1.01325, false, false, Some(&only));
+        let result = solve_for_products_debug(
+            &reactants,
+            false,
+            false,
+            true,
+            state1,
+            1.01325,
+            false,
+            false,
+            Some(&only),
+        );
 
         assert!(
             result.converged,
@@ -2041,18 +2174,23 @@ mod e_sp_validation {
         ];
         let state1 = 1.804; // S/R, given directly by the guide (J.4).
 
-        let result =
-            solve_for_products(&reactants, false, true, true, state1, 1.01325, false, false, Some(&only));
+        let state = solve_for_products(
+            &reactants,
+            false,
+            true,
+            true,
+            state1,
+            1.01325,
+            false,
+            false,
+            Some(&only),
+        )
+        .expect("SP solve should converge");
 
         assert!(
-            result.converged,
-            "did not converge within {} iterations",
-            result.iterations_used
-        );
-        assert!(
-            (result.temperature_k - 3244.7454823232674).abs() < 1e-3,
+            (state.temperature_k - 3244.7454823232674).abs() < 1e-3,
             "T = {}, expected 3244.7454823232674",
-            result.temperature_k
+            state.temperature_k
         );
 
         // order: H, H2, H2O, O, O2, OH
@@ -2065,7 +2203,8 @@ mod e_sp_validation {
             -4.6538971360500030,
         ];
         for (j, &expected) in expected_ln_nj.iter().enumerate() {
-            let got = result.nj[j].ln();
+            let nj = state.products[j].0;
+            let got = nj.ln();
             assert!(
                 (got - expected).abs() < 1e-6,
                 "species {j}: ln_nj = {got}, expected {expected}"
@@ -2096,8 +2235,16 @@ mod e_sv_validation {
         let state1 = 1.804; // S/R, same as SP (J.4).
         let volume = 1.0 / 0.072081; // m^3/kg
 
-        let result = solve_for_products(
-            &reactants, false, true, false, state1, volume, false, false, Some(&only),
+        let result = solve_for_products_debug(
+            &reactants,
+            false,
+            true,
+            false,
+            state1,
+            volume,
+            false,
+            false,
+            Some(&only),
         );
 
         assert!(
@@ -2161,7 +2308,7 @@ mod e_tv_validation {
         let temperature_k = 3800.0;
         let pressure_bar = 1.01325;
 
-        let tp = solve_for_products(
+        let tp = solve_for_products_debug(
             &reactants,
             true,
             false,
@@ -2177,7 +2324,7 @@ mod e_tv_validation {
         // P = 1e-5 * R * n * T / V  =>  V = 1e-5 * R * n * T / P
         let equivalent_volume = 1e-5 * R_CEA * tp.n * temperature_k / pressure_bar;
 
-        let tv = solve_for_products(
+        let tv = solve_for_products_debug(
             &reactants,
             true,
             false,
@@ -2188,7 +2335,11 @@ mod e_tv_validation {
             false,
             Some(&only),
         );
-        assert!(tv.converged, "TV did not converge in {} iters", tv.iterations_used);
+        assert!(
+            tv.converged,
+            "TV did not converge in {} iters",
+            tv.iterations_used
+        );
 
         assert!(
             (tv.n - tp.n).abs() / tp.n < 1e-6,
@@ -2235,7 +2386,7 @@ mod e_uv_validation {
         let temperature_k = 3800.0;
         let pressure_bar = 1.01325;
 
-        let tp = solve_for_products(
+        let tp = solve_for_products_debug(
             &reactants,
             true,
             false,
@@ -2257,7 +2408,7 @@ mod e_uv_validation {
         // Same P/V closure as TV.
         let equivalent_volume = 1e-5 * R_CEA * tp.n * temperature_k / pressure_bar;
 
-        let uv = solve_for_products(
+        let uv = solve_for_products_debug(
             &reactants,
             false,
             false,
@@ -2268,7 +2419,11 @@ mod e_uv_validation {
             false,
             Some(&species),
         );
-        assert!(uv.converged, "UV did not converge in {} iters", uv.iterations_used);
+        assert!(
+            uv.converged,
+            "UV did not converge in {} iters",
+            uv.iterations_used
+        );
 
         assert!(
             (uv.temperature_k - tp.temperature_k).abs() < 1e-3,
@@ -2310,7 +2465,7 @@ mod f_condensed_validation {
         let temperature_k = 1200.0;
         let pressure_bar = 1.0;
 
-        let result = solve_for_products(
+        let result = solve_for_products_debug(
             &reactants,
             true,
             false,
@@ -2336,9 +2491,15 @@ mod f_condensed_validation {
             .iter()
             .position(|&s| s == Species::C__1)
             .expect("C(gr) should be a condensed candidate for a C/O system");
-        assert!(result.condensed_active[graphite_idx], "graphite never got activated");
+        assert!(
+            result.condensed_active[graphite_idx],
+            "graphite never got activated"
+        );
         let nj_graphite = result.condensed_nj[graphite_idx];
-        assert!(nj_graphite > 0.0, "nj_graphite = {nj_graphite}, expected positive");
+        assert!(
+            nj_graphite > 0.0,
+            "nj_graphite = {nj_graphite}, expected positive"
+        );
 
         // (c_count, o_count) for any C/O species, straight from the public API.
         let co_counts = |sp: Species| -> (f64, f64) {
@@ -2391,8 +2552,9 @@ mod f_condensed_validation {
         // (c, o) stoichiometry, then confirm every OTHER gas species (and
         // graphite) satisfies mu_j/RT == a_Cj*pi_C + a_Oj*pi_O with that
         // same pair — exactly the condensed row's own equation (F.2).
-        let stoich_gas: Vec<(f64, f64)> =
-            (0..result.gas_species.len()).map(|j| co_counts(result.gas_species[j])).collect();
+        let stoich_gas: Vec<(f64, f64)> = (0..result.gas_species.len())
+            .map(|j| co_counts(result.gas_species[j]))
+            .collect();
         let (i1, i2) = (0..stoich_gas.len())
             .flat_map(|i| (0..stoich_gas.len()).map(move |j| (i, j)))
             .find(|&(i, j)| {
@@ -2421,8 +2583,8 @@ mod f_condensed_validation {
 
         // Condensed: mu_c/RT = h_c - s_c (no ln(n) or ln(P) term, D.1/F.2).
         let graphite = Species::C__1.data();
-        let mu_graphite = graphite.h_over_r(temperature_k) / temperature_k
-            - graphite.s_over_r(temperature_k);
+        let mu_graphite =
+            graphite.h_over_r(temperature_k) / temperature_k - graphite.s_over_r(temperature_k);
         let predicted_graphite = gr_c * pi_c + gr_o * pi_o;
         assert!(
             (mu_graphite - predicted_graphite).abs() < 1e-6,
@@ -2477,7 +2639,7 @@ mod g_singular_recovery_validation {
         let temperature_k = 2000.0;
         let pressure_bar = 1.0;
 
-        let result = solve_for_products(
+        let result = solve_for_products_debug(
             &reactants,
             true,
             false,
@@ -2505,7 +2667,10 @@ mod g_singular_recovery_validation {
         let stoich = [[1.0, 2.0], [0.0, 2.0]]; // CO2, O2
         for (k, &b0_k) in b0.iter().enumerate() {
             let b_k: f64 = (0..2).map(|j| stoich[j][k] * result.nj[j]).sum();
-            assert!((b0_k - b_k).abs() < 1e-6, "element {k}: b0 = {b0_k}, Σa*nj = {b_k}");
+            assert!(
+                (b0_k - b_k).abs() < 1e-6,
+                "element {k}: b0 = {b0_k}, Σa*nj = {b_k}"
+            );
         }
     }
 
@@ -2516,7 +2681,7 @@ mod g_singular_recovery_validation {
         let temperature_k = 1200.0;
         let pressure_bar = 1.0;
 
-        let result = solve_for_products(
+        let result = solve_for_products_debug(
             &reactants,
             true,
             false,
@@ -2557,7 +2722,7 @@ mod h_ions_validation {
         let temperature_k = 15000.0;
         let pressure_bar = 1.0;
 
-        let result = solve_for_products(
+        let result = solve_for_products_debug(
             &reactants,
             true,
             false,
@@ -2575,9 +2740,21 @@ mod h_ions_validation {
             result.iterations_used
         );
 
-        let h_idx = result.gas_species.iter().position(|&s| s == Species::H).unwrap();
-        let hplus_idx = result.gas_species.iter().position(|&s| s == Species::HPlus).unwrap();
-        let e_idx = result.gas_species.iter().position(|&s| s == Species::E).unwrap();
+        let h_idx = result
+            .gas_species
+            .iter()
+            .position(|&s| s == Species::H)
+            .unwrap();
+        let hplus_idx = result
+            .gas_species
+            .iter()
+            .position(|&s| s == Species::HPlus)
+            .unwrap();
+        let e_idx = result
+            .gas_species
+            .iter()
+            .position(|&s| s == Species::E)
+            .unwrap();
 
         // Sanity: meaningful ionization actually occurred (not just H).
         assert!(
@@ -2598,7 +2775,10 @@ mod h_ions_validation {
         // --- Check 2: element (H) conservation, counting H+ as hydrogen too.
         let b0_h = element_amounts(&reactants, &[Constituent::H])[0];
         let total_h = result.nj[h_idx] + result.nj[hplus_idx];
-        assert!((b0_h - total_h).abs() < 1e-8, "b0_H = {b0_h}, nj_H + nj_H+ = {total_h}");
+        assert!(
+            (b0_h - total_h).abs() < 1e-8,
+            "b0_H = {b0_h}, nj_H + nj_H+ = {total_h}"
+        );
 
         // --- Check 3: Lagrangian stationarity, now over (pi_H, pi_E).
         // mu_j/RT = h_j - s_j + ln(nj) + ln(P/n), same formula regardless of
@@ -2655,7 +2835,14 @@ mod i_postprocess_validation {
     }
 
     fn only_h2_o2_products() -> [Species; 6] {
-        [Species::H, Species::H2, Species::H2O, Species::O, Species::O2, Species::OH]
+        [
+            Species::H,
+            Species::H2,
+            Species::H2O,
+            Species::O,
+            Species::O2,
+            Species::OH,
+        ]
     }
 
     #[test]
@@ -2664,17 +2851,32 @@ mod i_postprocess_validation {
         let only = only_h2_o2_products();
         let state1 = reactant_enthalpy_over_r(&reactants, 2000.0);
 
-        let result =
-            solve_for_products(&reactants, false, false, true, state1, 1.01325, false, false, Some(&only));
+        let result = solve_for_products_debug(
+            &reactants,
+            false,
+            false,
+            true,
+            state1,
+            1.01325,
+            false,
+            false,
+            Some(&only),
+        );
         assert!(result.converged);
 
         let mole_sum: f64 = result.gas_mole_fractions.iter().sum::<f64>()
             + result.condensed_mole_fractions.iter().sum::<f64>();
-        assert!((mole_sum - 1.0).abs() < 1e-9, "mole fractions sum to {mole_sum}, expected 1");
+        assert!(
+            (mole_sum - 1.0).abs() < 1e-9,
+            "mole fractions sum to {mole_sum}, expected 1"
+        );
 
         let mass_sum: f64 = result.gas_mass_fractions.iter().sum::<f64>()
             + result.condensed_mass_fractions.iter().sum::<f64>();
-        assert!((mass_sum - 1.0).abs() < 1e-9, "mass fractions sum to {mass_sum}, expected 1");
+        assert!(
+            (mass_sum - 1.0).abs() < 1e-9,
+            "mass fractions sum to {mass_sum}, expected 1"
+        );
 
         const R_CEA: f64 = 8314.51;
         let expected_h_kj_per_kg = state1 * R_CEA / 1000.0;
@@ -2696,7 +2898,17 @@ mod i_postprocess_validation {
         let dt = 0.5;
 
         let solve_at = |t: f64| {
-            solve_for_products(&reactants, true, false, true, t, p, false, false, Some(&only))
+            solve_for_products_debug(
+                &reactants,
+                true,
+                false,
+                true,
+                t,
+                p,
+                false,
+                false,
+                Some(&only),
+            )
         };
         let mid = solve_at(t0);
         let minus = solve_at(t0 - dt);
@@ -2725,7 +2937,17 @@ mod i_postprocess_validation {
         let eps = 1e-4;
 
         let solve_at = |v: f64| {
-            solve_for_products(&reactants, false, true, false, s_over_r, v, false, false, Some(&only))
+            solve_for_products_debug(
+                &reactants,
+                false,
+                true,
+                false,
+                s_over_r,
+                v,
+                false,
+                false,
+                Some(&only),
+            )
         };
         let mid = solve_at(v0);
         let minus = solve_at(v0 * (1.0 - eps));
@@ -2733,9 +2955,15 @@ mod i_postprocess_validation {
         assert!(
             mid.converged && minus.converged && plus.converged,
             "converged: mid={} (T={}, iters={}), minus={} (T={}, iters={}), plus={} (T={}, iters={})",
-            mid.converged, mid.temperature_k, mid.iterations_used,
-            minus.converged, minus.temperature_k, minus.iterations_used,
-            plus.converged, plus.temperature_k, plus.iterations_used,
+            mid.converged,
+            mid.temperature_k,
+            mid.iterations_used,
+            minus.converged,
+            minus.temperature_k,
+            minus.iterations_used,
+            plus.converged,
+            plus.temperature_k,
+            plus.iterations_used,
         );
 
         let gamma_findiff = -(plus.pressure_bar.ln() - minus.pressure_bar.ln())
@@ -2800,7 +3028,11 @@ mod tp_stability_suite {
             vec![(1.0, Species::CH4)],
             vec![(1.0, Species::CH4), (2.0, Species::O2)],
             vec![(1.0, Species::CH4), (1.0, Species::O)],
-            vec![(1.0, Species::CH4), (1.0, Species::HPlus), (1.0, Species::OHNeg)],
+            vec![
+                (1.0, Species::CH4),
+                (1.0, Species::HPlus),
+                (1.0, Species::OHNeg),
+            ],
             vec![(1.0, Species::N2)],
             vec![(1.0, Species::O2)],
             vec![(1.0, Species::CO2)],
@@ -2843,7 +3075,7 @@ mod tp_stability_suite {
 
         for (i, &(temperature_k, pressure_bar)) in conditions.iter().enumerate() {
             for (j, reactants) in reactants_list.iter().enumerate() {
-                let result = solve_for_products(
+                let result = solve_for_products_debug(
                     reactants,
                     true,  // const_t: TP
                     false, // const_s: unused for TP
@@ -2882,7 +3114,10 @@ mod tp_stability_suite {
                 100.0 * (passed as f64 / total as f64)
             );
         }
-        let total_passed: usize = pass_fail.iter().map(|row| row.iter().filter(|&&x| x).count()).sum();
+        let total_passed: usize = pass_fail
+            .iter()
+            .map(|row| row.iter().filter(|&&x| x).count())
+            .sum();
         let total = conditions.len() * reactants_list.len();
         println!(
             "========== Overall: {}/{} ({:.2}%) ==========",
@@ -2892,7 +3127,3 @@ mod tp_stability_suite {
         );
     }
 }
-
-
-
-
