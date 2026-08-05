@@ -24,33 +24,24 @@ pub struct SpeciesData<const C: usize, const T: usize> {
     pub temperature_data: [(f64, f64, [f64; 9]); T],
     pub mw: f64,
     pub h_formation: f64,
-    /// 0 = gas, non-zero = condensed. The specific non-zero value is not
-    /// semantically meaningful (NASA's raw record ordinal, not a phase ID)
-    /// and is arbitrary after lambda-transition merging.
+    /// 0 = gas, non-zero = condensed: thermo.inp's raw `ifaz` column.
+    /// Sibling phases of one substance carry adjacent values (H2O(cr)=1,
+    /// H2O(L)=2), which is what CEA's phase-transition logic compares.
     pub phase: u8,
 }
 
 fn find_coefficients(ranges: &[(f64, f64, [f64; 9])], temperature_k: f64) -> &(f64, f64, [f64; 9]) {
-    // Check if temperature_k is greater than the maximum range we have.
-    if let Some(last) = ranges.last()
-        && temperature_k >= last.1
-    {
-        return last;
-    }
-    // Check if temperature_k is less than the minimum range we have.
-    if let Some(first) = ranges.first()
-        && temperature_k <= first.0
-    {
-        return first;
-    }
-    // Falls within a range we have.
-    for coeff in ranges.iter() {
-        if temperature_k >= coeff.0 && temperature_k <= coeff.1 {
-            return coeff;
+    // CEA's interval rule: the LAST interval whose LOWER bound is strictly
+    // exceeded by T; below every interval extrapolate on the first, above on
+    // the last. Never rejects a T — a gap between condensed intervals
+    // extrapolates on the interval below it rather than being an error.
+    let mut idx = 0;
+    for (i, coeff) in ranges.iter().enumerate() {
+        if temperature_k > coeff.0 {
+            idx = i;
         }
     }
-
-    panic!("Not sure how we got here");
+    &ranges[idx]
 }
 
 pub trait AnySpeciesData {

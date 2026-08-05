@@ -62,6 +62,33 @@ struct TpSolveDebug {
     /// auto-generated rather than known in advance.
     gas_species: Vec<Species>,
     condensed_species: Vec<Species>,
+
+    // --- Section I: post-processing & thermodynamic derivatives ---
+    // Computed once at the final state (converged or not — matches the
+    // guide's "never a hard failure" framing for I.2/I.3); never gates
+    // `converged` itself.
+    pressure_bar: f64,
+    volume_m3_per_kg: f64,
+    enthalpy_kj_per_kg: f64,
+    energy_kj_per_kg: f64, // U
+    entropy_kj_per_kg_k: f64,
+    gibbs_kj_per_kg: f64,
+    molar_mass_kg_per_kmol: f64,             // M = 1/n
+    mean_molecular_weight_kg_per_kmol: f64,  // MW, gas-only (Eq. 2.4)
+    cp_frozen_kj_per_kg_k: f64,
+    cv_frozen_kj_per_kg_k: f64,
+    // I.2: equilibrium (reacting) specific heats and isentropic exponent.
+    // Fall back to I.1/I.3's degrade-gracefully constants if the partials
+    // system (which shares the converged matrix's LHS) turns out singular
+    // — rare, since that same LHS structure already solved successfully.
+    cp_eq_kj_per_kg_k: f64,
+    cv_eq_kj_per_kg_k: f64,
+    gamma_s: f64,
+    // Mole/mass fractions, split gas/condensed like gas_species/condensed_species.
+    gas_mole_fractions: Vec<f64>,
+    condensed_mole_fractions: Vec<f64>,
+    gas_mass_fractions: Vec<f64>,
+    condensed_mass_fractions: Vec<f64>,
 }
 
 struct MixtureThermo {
@@ -191,6 +218,152 @@ fn damping_lambda(ln_nj: &[f64], dln_nj: &[f64], dln_n: f64, dln_t: f64, n: f64,
     1.0_f64.min(lambda1).min(lambda2)
 }
 
+// AI.3.9: condensed add/remove/phase-swap and singular-recovery events are
+// the primary debugging tool when a condensed set oscillates. Set CEA_DEBUG=1
+// to mirror CEA's logging of them.
+macro_rules! cea_debug {
+    ($($arg:tt)*) => {
+        if std::env::var_os("CEA_DEBUG").is_some() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
+// F.4 (`check_condensed_phases`): phase-validity and phase-transition logic
+// for condensed species with sibling phases (H2O(cr) vs H2O(L), Al2O3(a) vs
+// Al2O3(L), ...). Sibling discovery uses Species::phases() (the build-time
+// equivalent of CEA's trailing-suffix stripping), sorted by max fit
+// temperature ("melting point") low→high; `phase()` is thermo.inp's raw ifaz,
+// where adjacent phases of one substance differ by 1. At most ONE change per
+// call, reported by the return value so the caller restarts its epoch.
+//
+// One deviation from the Fortran: the melting-point coexistence path pins T
+// to the transition temperature, which only makes sense when T is a Newton
+// unknown — for const-T problems the user's T stays untouched (the doomed
+// phase then dies through F.3.1's negative-amount removal instead).
+#[allow(clippy::too_many_arguments)]
+fn check_condensed_phases(
+    species: &[Species],
+    ng: usize,
+    const_t: bool,
+    temperature_k: &mut f64,
+    nj_c: &mut [f64],
+    is_active: &mut [bool],
+    active_ranked: &mut Vec<usize>,
+    j_switch: &mut Option<usize>,
+    j_sol: &mut Option<usize>,
+    j_liq: &mut Option<usize>,
+) -> bool {
+    const DT_PHASE: f64 = 50.0; // K, "near the transition" half-width
+    let cond_index = |sp: Species| species[ng..].iter().position(|&s| s == sp);
+
+    let snapshot = active_ranked.clone();
+    for &i in &snapshot {
+        // The pinned solid+liquid pair is exempt from further checks.
+        if Some(i) == *j_sol || Some(i) == *j_liq {
+            continue;
+        }
+        let sc_i = ng + i;
+        let (t_low_i, t_high_i) = species[sc_i].data().valid_temperature_range();
+
+        // Sibling phases (self included), sorted by melting point low→high.
+        let mut siblings: Vec<usize> = species[sc_i]
+            .phases()
+            .iter()
+            .filter_map(|&sp| cond_index(sp))
+            .collect();
+        siblings.sort_by(|&a, &b| {
+            let ta = species[ng + a].data().valid_temperature_range().1;
+            let tb = species[ng + b].data().valid_temperature_range().1;
+            ta.partial_cmp(&tb).unwrap()
+        });
+        let max_t_sibling = siblings
+            .iter()
+            .map(|&j| species[ng + j].data().valid_temperature_range().1)
+            .fold(0.0_f64, f64::max);
+
+        for &j in &siblings {
+            let (_, t_high_j) = species[ng + j].data().valid_temperature_range();
+            if *temperature_k > t_high_j {
+                continue; // sibling j can't exist at T
+            }
+            let d_phase =
+                species[sc_i].data().phase() as i32 - species[ng + j].data().phase() as i32;
+            if d_phase == 0 {
+                break; // reached i itself (same phase id) — stop scanning
+            }
+            if is_active[j] {
+                continue; // both already active; nothing to transition
+            }
+            let out_of_range =
+                *temperature_k < t_low_i - DT_PHASE || *temperature_k > t_high_i + DT_PHASE;
+            if d_phase.abs() > 1 || (Some(j) != *j_switch && out_of_range) {
+                cea_debug!(
+                    "[F.4] replacing {} with {} at T={temperature_k}",
+                    species[sc_i].data().symbol(),
+                    species[ng + j].data().symbol()
+                );
+                // REPLACE i by j: transfer the amount, preserve i's rank.
+                let pos = active_ranked.iter().position(|&x| x == i).unwrap();
+                active_ranked[pos] = j;
+                is_active[i] = false;
+                is_active[j] = true;
+                nj_c[j] = nj_c[i];
+                nj_c[i] = 0.0;
+                *j_switch = Some(i);
+                *j_sol = None;
+                *j_liq = None;
+            } else {
+                // Melting-point coexistence (either we just swapped i in for
+                // j and the iterate is bouncing back — j == j_switch — or T
+                // sits within ±50 K of i's own range edge): keep BOTH
+                // phases, pin T to the transition temperature (variable-T
+                // problems only), split the amount 50/50.
+                cea_debug!(
+                    "[F.4] coexistence {} + {} at T={temperature_k}",
+                    species[sc_i].data().symbol(),
+                    species[ng + j].data().symbol()
+                );
+                if !const_t {
+                    *temperature_k = t_high_i.min(t_high_j);
+                }
+                if t_high_i > t_high_j {
+                    *j_sol = Some(j);
+                    *j_liq = Some(i);
+                } else {
+                    *j_sol = Some(i);
+                    *j_liq = Some(j);
+                }
+                is_active[j] = true;
+                active_ranked.insert(0, j);
+                nj_c[i] /= 2.0;
+                nj_c[j] = nj_c[i];
+            }
+            return true;
+        }
+
+        if *temperature_k > 1.2 * max_t_sibling {
+            cea_debug!(
+                "[F.4] removing {} — T={temperature_k} above 1.2*{max_t_sibling}",
+                species[sc_i].data().symbol()
+            );
+            // Way above every sibling's range: remove i entirely.
+            is_active[i] = false;
+            nj_c[i] = 0.0;
+            active_ranked.retain(|&x| x != i);
+            *j_switch = None;
+            *j_sol = None;
+            *j_liq = None;
+            return true;
+        }
+    }
+    false
+}
+
+// unused_assignments: pi_e's zeroing/accumulation sites mirror CEA's control
+// flow literally (guide H.2's ⚠ note); some are dead under H.3's overwrite,
+// exactly as in the Fortran.
+#[allow(unused_assignments)]
 fn solve_for_products(
     reactants: &[(f64, Species)],
     // Section E.1: which state1/state2 pair this problem fixes. Only 't'
@@ -307,10 +480,14 @@ fn solve_for_products(
     // because G.2's correct_singular sets it to 80 (disabling truncation)
     // as its first action on any singular matrix.
     let mut tsize: f64 = 18.420681;
+    // D.4/D.5: the looser threshold tsize relaxes to on each convergence
+    // (default ≈1e-11; would be -ln(trace) if a user trace level existed) —
+    // this second stage is how CEA resolves trace species accurately after
+    // the main composition settles.
+    let mut xsize: f64 = 25.328436;
     // H.1: charged species get the tighter esize threshold instead of tsize
-    // (ions live at much smaller mole fractions). Guide's default value —
-    // we don't have `trace`/xsize implemented, so this doesn't vary.
-    const ESIZE: f64 = 32.236191;
+    // (ions live at much smaller mole fractions) = min(80, xsize + ln 1000).
+    let mut esize: f64 = 32.236191;
     // D.5 tolerances (guide's Global conventions).
     const NJ_TOL: f64 = 0.5e-5;
     const B_TOL: f64 = 1e-6;
@@ -347,6 +524,35 @@ fn solve_for_products(
     // not implemented — see the module note on Section F's scope).
     let mut nj_c = vec![0.0; nc];
     let mut is_active = vec![false; nc];
+    // F.1: active condensed species ordered by activation rank, NEWEST FIRST
+    // — this ordering decides matrix row order and therefore how a singular
+    // ierr in the condensed block maps back to a species (G.2c / AI.1.2).
+    let mut active_ranked: Vec<usize> = Vec::new();
+    // F.4 phase-transition bookkeeping: the phase most recently swapped out
+    // (re-encountering it means melting-point coexistence), and the pinned
+    // solid+liquid pair at a melting point.
+    let mut j_switch: Option<usize> = None;
+    let mut j_sol: Option<usize> = None;
+    let mut j_liq: Option<usize> = None;
+    // F.3.3/G.2: a condensed species removed because it made the matrix
+    // singular; the insertion test must never re-add it (and per the guide,
+    // its delta-G still being negative afterwards is a hard failure).
+    let mut singular_blocklist: Option<usize> = None;
+    // F.3.4/G.1: how many times the inner Newton loop has converged this
+    // solve — repeated re-convergence means the condensed set is thrashing.
+    let mut times_converged: usize = 0;
+    // H.2/H.3: whether the electron-balance polish has converged, and whether
+    // the last convergence check's base tests passed (the pair gates the
+    // pi_e feedback: it fires only on the Newton sweep right after a
+    // converged-but-ions-unpolished check).
+    let mut ions_converged = false;
+    let mut base_converged_prev = false;
+    // G.2(a): the condensed species most recently activated by F.3.3 —
+    // needed because a singular matrix on the very first attempt after an
+    // insertion usually means the new species conflicts with an existing
+    // one over some element, not that the row indicated by `ierr` itself is
+    // individually degenerate.
+    let mut last_cond_idx: Option<usize> = None;
     // pi_prev doubles as both "the pi from the last successful solve" (what
     // F.3.3's insertion test calls pi_prev) and "the current pi" used to
     // recover dln_nj (D.1/E.3) — the guide sets pi_prev = pi after every
@@ -372,16 +578,64 @@ fn solve_for_products(
     let mut iterations_used = 0;
     let mut iteration = 0usize;
     let mut times_singular = 0usize;
+    // G.3: fires at most once per solve.
+    let mut g3_fallback_used = false;
+    // HP is const_t==false, const_p==true, const_s==false (the only
+    // problem type among TP/HP/SP/TV/UV/SV that matches that combination).
+    let is_hp = !const_t && const_p && !const_s;
 
     for total_iteration in 0..MAX_TOTAL_ITERATIONS {
         if iteration >= MAX_ITERATIONS {
-            break; // this epoch's budget is exhausted (Section G territory)
+            // G.3: max-iteration high-T condensed fallback. If the iterate
+            // has collapsed into a single condensed phase with essentially
+            // no gas left (n <= 1e-4), the Newton state has nothing left to
+            // work with — reset to the uniform initial guess and drop that
+            // condensed species, then keep going instead of giving up.
+            let single_active_condensed = (0..nc).filter(|&c| is_active[c]).count() == 1;
+            if !g3_fallback_used && (!is_hp || temperature_k > 100.0) && single_active_condensed && n <= 1e-4
+            {
+                g3_fallback_used = true;
+                for c in 0..nc {
+                    if is_active[c] {
+                        is_active[c] = false;
+                        nj_c[c] = 0.0;
+                        j_switch = Some(c); // guide G.3: mark the dropped phase
+                    }
+                }
+                active_ranked.clear();
+                j_sol = None;
+                j_liq = None;
+                times_converged = 0;
+                n = 0.1;
+                for j in 0..ng {
+                    ln_nj[j] = (0.1 / ng as f64).ln();
+                }
+                iteration = 0;
+                continue;
+            }
+            break; // this epoch's budget is exhausted, no fallback applies — give up.
         }
         iteration += 1;
         iterations_used = total_iteration + 1;
 
-        let active_condensed: Vec<usize> = (0..nc).filter(|&c| is_active[c]).collect();
+        // Divergence guard (not in the guide): the phase-rule-degenerate
+        // family (a lone condensed phase + nearly-pure gas of the same
+        // substance) can drift n upward unboundedly instead of failing
+        // cleanly — n above ~500 kmol/kg (1 kg of free electrons) is
+        // physically impossible, so stop wasting the iteration budget.
+        if n > 1e4 {
+            cea_debug!("[guard] n={n} diverged — giving up");
+            break;
+        }
+
+        let active_condensed: Vec<usize> = active_ranked.clone();
         let na = active_condensed.len();
+        // NOTE: unlike CEA, the E pseudo-element's row stays in the matrix
+        // when ions die mid-solve — the reseeded ~1e-6 charged species sit
+        // above the tsize truncation threshold and keep evolving, and with
+        // no other element to pin them (e- has none) dropping the charge
+        // balance lets them run away. If the row itself degenerates, G.2(d)
+        // handles it.
         let active_elements: Vec<usize> = (0..ne).filter(|&k| !element_excluded[k]).collect();
         let ne_active = active_elements.len();
 
@@ -430,7 +684,7 @@ fn solve_for_products(
         // sum. Charged species use the tighter esize threshold.
         let nj_eff: Vec<f64> = (0..ng)
             .map(|j| {
-                let threshold = n.ln() - if is_ion[j] { ESIZE } else { tsize };
+                let threshold = n.ln() - if is_ion[j] { esize } else { tsize };
                 if ln_nj[j] > threshold {
                     ln_nj[j].exp()
                 } else {
@@ -438,13 +692,6 @@ fn solve_for_products(
                 }
             })
             .collect();
-
-        // H.3: if ions are active but every charged species has decayed to
-        // nothing, ions turn off permanently for the rest of this solve —
-        // the E element/column then behaves as if include_ions were false.
-        if active_ions && (0..ng).all(|j| !(stoich[j][ne - 1] != 0.0 && nj_eff[j] > 0.0)) {
-            active_ions = false;
-        }
 
         // b_delta[k] = b0[k] - Σ_j a_kj*n_j, over ALL species — gas
         // (truncated) plus active condensed (F.2's explicit list of where
@@ -655,18 +902,60 @@ fn solve_for_products(
         if let Err(ierr) = gauss(&mut g) {
             // G.2 correct_singular(ierr): "first action always" is to
             // disable truncation, then try recovery branches in order,
-            // first match wins. (a) freshly-added-condensed-conflict and
-            // (d) electron-row fallback aren't implemented — (a) needs
-            // F.4's rank/j_switch bookkeeping, (d) needs Section H's ions.
+            // first match wins.
             times_singular += 1;
+            cea_debug!(
+                "[G.2] singular ierr={ierr} times={times_singular} iter={iteration} ne_active={ne_active} na={na}"
+            );
             if times_singular > MAX_SINGULAR_RETRIES {
                 break; // G.1: give up: converged stays false.
             }
+            // G.2's "first action always": disable truncation entirely —
+            // all three thresholds, so charged species un-truncate too, and
+            // xsize so a later convergence's tsize = xsize keeps it off.
             tsize = 80.0;
+            xsize = 80.0;
+            esize = 80.0;
             let mut changed = false;
 
+            // (a) freshly-added condensed conflicts: a singular matrix on
+            // the very first attempt after F.3.3 activated a new condensed
+            // species, hitting a condensed row, usually means the new
+            // species and an existing one are fighting over some shared
+            // element — remove whichever OTHER active condensed species
+            // shares an element with the freshly-added one and has the
+            // smallest amount, rather than trusting `ierr`'s own index.
+            if !changed
+                && ierr >= ne_active
+                && iteration <= 1
+                && na > 1
+                && let Some(last) = last_cond_idx
+                && is_active.get(last).copied().unwrap_or(false)
+            {
+                let last_sc = ng + last;
+                let worst = active_condensed
+                    .iter()
+                    .filter(|&&c| {
+                        c != last && (0..ne).any(|k| stoich[ng + c][k] != 0.0 && stoich[last_sc][k] != 0.0)
+                    })
+                    .min_by(|&&a, &&b| nj_c[a].partial_cmp(&nj_c[b]).unwrap());
+                if let Some(&c) = worst {
+                    is_active[c] = false;
+                    nj_c[c] = 0.0;
+                    active_ranked.retain(|&x| x != c);
+                    j_switch = Some(c);
+                    singular_blocklist = Some(c);
+                    if j_sol == Some(c) || j_liq == Some(c) {
+                        j_sol = None;
+                        j_liq = None;
+                    }
+                    changed = true;
+                }
+            }
+
             // (b) element-row singularity: remove the smallest-nj active
-            // condensed species that actually touches this element.
+            // condensed species that actually touches this element (same
+            // j_switch/blocklist bookkeeping as (a)).
             if !changed && ierr < ne_active && na > 0 {
                 let k = active_elements[ierr];
                 let worst = active_condensed
@@ -676,16 +965,51 @@ fn solve_for_products(
                 if let Some(&c) = worst {
                     is_active[c] = false;
                     nj_c[c] = 0.0;
+                    active_ranked.retain(|&x| x != c);
+                    j_switch = Some(c);
+                    singular_blocklist = Some(c);
+                    if j_sol == Some(c) || j_liq == Some(c) {
+                        j_sol = None;
+                        j_liq = None;
+                    }
                     changed = true;
                 }
             }
 
-            // (c) condensed-row singularity: deactivate that condensed
-            // species outright.
+            // (c) condensed-row singularity: deactivate the condensed
+            // species at that active RANK (active_condensed is rank-ordered,
+            // so this index maps exactly like the guide's G.2c).
             if !changed && ierr >= ne_active && ierr < ne_active + na {
                 let c = active_condensed[ierr - ne_active];
                 is_active[c] = false;
                 nj_c[c] = 0.0;
+                active_ranked.retain(|&x| x != c);
+                if j_sol == Some(c) || j_liq == Some(c) {
+                    j_sol = None;
+                    j_liq = None;
+                }
+                changed = true;
+            }
+
+            // (d) electron-row fallback: the E (electron) element row
+            // itself is degenerate — the ion channel isn't solvable this
+            // way for this state. Zero out every charged gas species (down
+            // to SMNOL, not literally -inf, so they stay Newton-updatable)
+            // and permanently disable ions for the rest of this solve.
+            if !changed
+                && ierr < ne_active
+                && active_ions
+                && has_electron
+                && active_elements[ierr] == ne - 1
+            {
+                for j in 0..ng {
+                    if stoich[j][ne - 1] != 0.0 {
+                        ln_nj[j] = -13.815511; // SMNOL = ln(1e-6)
+                    }
+                }
+                active_ions = false;
+                pi_e = 0.0;
+                pi_prev[ne - 1] = 0.0;
                 changed = true;
             }
 
@@ -698,9 +1022,17 @@ fn solve_for_products(
             // matters: firing it eagerly can permanently drop a real
             // constraint (nothing left to pin, say, total oxygen) when the
             // real fix was just to reseed a decayed species (f) instead.
-            if !changed && ierr < ne_active && ne_active > 1 && (iteration <= 1 || times_singular >= 4)
+            // (guide's extra gate: never element-reduce while ions are live —
+            // the E row's degeneracy is (d)'s job, not a reason to drop a
+            // real element constraint.)
+            if !changed
+                && ierr < ne_active
+                && ne_active > 1
+                && (iteration <= 1 || times_singular >= 4)
+                && !(include_ions && active_ions)
             {
                 let k = active_elements[ierr];
+                cea_debug!("[G.2e] excluding element {:?}", constituent_pool[k]);
                 element_excluded[k] = true;
                 pi_prev[k] = 0.0;
                 changed = true;
@@ -720,6 +1052,24 @@ fn solve_for_products(
             iteration = 0; // restart this epoch's iteration budget
             continue;
         }
+        // H.3 (CEA: get_solution_vars, i.e. AFTER the linear solve): if ions
+        // are active but every charged species has decayed to nothing, ions
+        // turn off permanently for this solve and the charged species get
+        // parked at SMNOL. This must NOT run before assembly — an all-zero E
+        // row must reach `gauss` while active_ions is still true, so the
+        // singularity routes to G.2(d)'s ion shutdown rather than G.2(e)
+        // wrongly excluding the E element (which would leave the parked
+        // species with no charge balance pinning them, free to run away).
+        if active_ions && (0..ng).all(|j| !(stoich[j][ne - 1] != 0.0 && nj_eff[j] > 0.0)) {
+            cea_debug!("[H.3] all charged species decayed — ions off");
+            active_ions = false;
+            pi_prev[ne - 1] = 0.0;
+            for j in 0..ng {
+                if stoich[j][ne - 1] != 0.0 {
+                    ln_nj[j] = -13.815511; // SMNOL = ln(1e-6)
+                }
+            }
+        }
         // pi_prev doubles as "current pi" here (see its declaration) — only
         // active positions get overwritten; excluded ones (G.2e) keep
         // whatever they were (zeroed at the moment they got excluded).
@@ -730,17 +1080,22 @@ fn solve_for_products(
         // TV: no Δln n unknown at all — dln_n stays 0 (E.1).
         let dln_n = if const_p { g[(lnn_col, neq)] } else { 0.0 };
         let dln_t = if const_t { 0.0 } else { g[(lnt_col, neq)] };
+        // H.3: the pi_e feedback fires only on the Newton sweep immediately
+        // after a check that converged on the base tests but whose electron
+        // polish did NOT settle — then pi_e is the E-element multiplier from
+        // THIS solve, layered on top of the regular pi sum so the neutral
+        // species re-equilibrate against the shifted ions. Otherwise 0.
+        pi_e = if active_ions && has_electron && base_converged_prev && !ions_converged {
+            pi_prev[ne - 1]
+        } else {
+            0.0
+        };
         let dln_nj: Vec<f64> = (0..ng)
             .map(|j| {
                 -mu_g[j]
                     + dln_n
                     + (0..ne).map(|i| stoich[j][i] * pi_prev[i]).sum::<f64>()
                     + dln_t * energy_weight[j] // h_j if const_p, u_j if const_v (E.3)
-                    // H.3: on top of the regular pi_E term already folded
-                    // into the sum above (i == ne-1), the electron-polish's
-                    // OWN separate correction from the last H.2 pass — pi_e
-                    // starts at 0 and stays 0 unless ions are active, so
-                    // this is a no-op for non-ionized problems.
                     + stoich[j][ne - 1] * pi_e
             })
             .collect();
@@ -757,7 +1112,7 @@ fn solve_for_products(
         let applied_dln_nj: Vec<f64> = (0..ng).map(|j| lambda * dln_nj[j]).collect();
         for j in 0..ng {
             ln_nj[j] += applied_dln_nj[j];
-            let threshold = n.ln() - if is_ion[j] { ESIZE } else { tsize };
+            let threshold = n.ln() - if is_ion[j] { esize } else { tsize };
             nj_stored[j] = if ln_nj[j] > threshold { ln_nj[j].exp() } else { 0.0 };
         }
         // F.2: condensed update is LINEAR, not log-space, and can go
@@ -814,8 +1169,10 @@ fn solve_for_products(
         // Test 2: condensed species (active only).
         let test2 = (0..na).all(|idx| applied_dnj_c[idx].abs() / sum_nj <= NJ_TOL);
 
-        // Test 3: total moles (const_p only).
-        let test3 = !const_p || n * applied_dln_n.abs() / sum_nj <= NJ_TOL;
+        // Test 3: total moles (const_p only). Denominator is Σ over GAS
+        // species only, unlike tests 1/2's gas+condensed sum_nj.
+        let gas_sum_nj: f64 = nj_stored.iter().sum();
+        let test3 = !const_p || n * applied_dln_n.abs() / gas_sum_nj <= NJ_TOL;
 
         // Test 4: elements, using RAW nj (not the stored/truncated values)
         // for gas, and the linear nj_c for condensed.
@@ -856,6 +1213,29 @@ fn solve_for_products(
         };
 
         let base_tests_pass = test1 && test2 && test3 && test4 && test5 && test6;
+        base_converged_prev = base_tests_pass;
+
+        if base_tests_pass {
+            // D.5's on-success actions: loosen truncation to xsize (this is
+            // a persistent mutation — how CEA resolves trace species after
+            // the main composition settles) and recompute the effective
+            // amounts at the looser threshold.
+            times_converged += 1;
+            tsize = xsize;
+            for j in 0..ng {
+                let threshold = n.ln() - if is_ion[j] { esize } else { tsize };
+                nj_stored[j] = if ln_nj[j] > threshold { ln_nj[j].exp() } else { 0.0 };
+            }
+            cea_debug!(
+                "[D.5] base converged (times={times_converged}) T={temperature_k} n={n} iter={iteration}"
+            );
+            // F.3.4/G.1: repeated re-convergence means the condensed set is
+            // thrashing — give up (converged stays false).
+            if times_converged > 3 * ne_active.max(1) {
+                cea_debug!("[F.3.4] condensed-set thrash — giving up");
+                break;
+            }
+        }
 
         // H.2: post-convergence electron-balance polish. Runs only once the
         // other six tests already pass — the tiny electron concentration
@@ -876,7 +1256,7 @@ fn solve_for_products(
                         continue;
                     }
                     let raw = if ln_nj[j] > -87.0 { ln_nj[j].exp() } else { 0.0 };
-                    nj_stored[j] = if ln_nj[j] > n.ln() - ESIZE { raw } else { 0.0 };
+                    nj_stored[j] = if ln_nj[j] > n.ln() - esize { raw } else { 0.0 };
                     sum1 += a_e * raw; // RAW amount in the sums, not truncated
                     sum2 += a_e * a_e * raw;
                 }
@@ -897,6 +1277,7 @@ fn solve_for_products(
                     break; // accumulated value (not this final increment).
                 }
             }
+            ions_converged = polished;
             if !polished {
                 pi_e = 0.0; // 80 sub-iterations exhausted: reset and retry.
                 ion_gate_pass = false;
@@ -909,10 +1290,9 @@ fn solve_for_products(
 
         // F.3: test_condensed — runs only after the inner Newton loop
         // converges, and may still flip things back to "keep going" by
-        // changing the active set. Only F.3.1 (remove) and F.3.3 (insert)
-        // are implemented — F.3.2/F.4 (phase-validity/transition, which
-        // needs sibling-phase rank ordering) and F.3.4 (thrash guard, we
-        // just rely on MAX_TOTAL_ITERATIONS instead) are not.
+        // changing the active set. Priority order per the guide: F.3.1
+        // remove negatives, F.3.2/F.4 phase validity, F.3.3 insert; one
+        // change per call, and any change restarts the epoch budget.
         let mut changed = false;
 
         // F.3.1: remove the active condensed species with the most negative
@@ -926,10 +1306,32 @@ fn solve_for_products(
                 }
             }
             if let Some((c, _)) = worst {
+                cea_debug!("[F.3.1] removing {} (nj={})", species[ng + c].data().symbol(), nj_c[c]);
                 is_active[c] = false;
                 nj_c[c] = 0.0;
+                active_ranked.retain(|&x| x != c);
+                if j_sol == Some(c) || j_liq == Some(c) {
+                    j_sol = None;
+                    j_liq = None;
+                }
                 changed = true;
             }
+        }
+
+        // F.3.2/F.4: phase-validity and phase-transition check.
+        if !changed && nc > 0 {
+            changed = check_condensed_phases(
+                &species,
+                ng,
+                const_t,
+                &mut temperature_k,
+                &mut nj_c,
+                &mut is_active,
+                &mut active_ranked,
+                &mut j_switch,
+                &mut j_sol,
+                &mut j_liq,
+            );
         }
 
         // F.3.3: insertion test — only if nothing was removed this pass.
@@ -938,6 +1340,7 @@ fn solve_for_products(
         // most negative one (only one insertion per call).
         if !changed && nc > 0 {
             let mut best: Option<(usize, f64)> = None;
+            let mut blocked_wants_in = false;
             for c in 0..nc {
                 if is_active[c] {
                     continue;
@@ -953,21 +1356,46 @@ fn solve_for_products(
                     - mixture_thermo_post.entropy[sc]
                     - a_pi)
                     / species[sc].data().mw();
+                if Some(c) == singular_blocklist {
+                    // G.2 removed this species for singularizing the matrix;
+                    // never re-add it. Wanting back in is CEA's hard-error
+                    // "re-insertion likely to cause singular matrix".
+                    if delta_g < -1e-12 {
+                        blocked_wants_in = true;
+                    }
+                    continue;
+                }
                 if delta_g < 0.0 && best.is_none_or(|(_, b)| delta_g < b) {
                     best = Some((c, delta_g));
                 }
             }
-            if let Some((c, delta_g)) = best {
-                if delta_g.abs() > 1e-12 {
+            match best {
+                Some((c, delta_g)) if delta_g.abs() > 1e-12 => {
+                    cea_debug!(
+                        "[F.3.3] inserting {} (delta_g={delta_g}) T={temperature_k}",
+                        species[ng + c].data().symbol()
+                    );
+                    // F.1: activate at rank 1 ("front"); nj stays 0 and the
+                    // first Newton step sizes it.
                     is_active[c] = true;
                     nj_c[c] = 0.0;
+                    active_ranked.insert(0, c);
+                    last_cond_idx = Some(c); // G.2(a): remember for the next singular-matrix check.
                     changed = true;
                 }
+                None if blocked_wants_in => {
+                    // Nothing else can be inserted, and the equilibrium
+                    // genuinely wants the blocklisted species: unsolvable as
+                    // configured (CEA aborts here) — return unconverged.
+                    break;
+                }
+                _ => {}
             }
         }
 
         if changed {
             iteration = 0; // F.3: restart this epoch's iteration budget.
+            ions_converged = false; // the changed set needs a fresh polish.
             continue;
         }
 
@@ -975,7 +1403,196 @@ fn solve_for_products(
         break;
     }
 
-    let nj: Vec<f64> = (0..ng).map(|j| ln_nj[j].exp()).collect();
+    // G.1: final sanity bounds — a "converged" T outside CEA's physical
+    // range means the iterate ran away, not that the problem was solved.
+    if converged && !(160.0..=22000.0).contains(&temperature_k) {
+        converged = false;
+    }
+
+    // Section I: post-processing & thermodynamic derivatives. Runs once, at
+    // the final state, independent of the main loop's per-iteration scoping.
+    let active_condensed: Vec<usize> = (0..nc).filter(|&c| is_active[c]).collect();
+    let na = active_condensed.len();
+    let active_elements: Vec<usize> = (0..ne).filter(|&k| !element_excluded[k]).collect();
+    let ne_active = active_elements.len();
+
+    let mut final_thermo = MixtureThermo {
+        cp: vec![0.0; ns],
+        cv: vec![0.0; ns],
+        enthalpy: vec![0.0; ns],
+        entropy: vec![0.0; ns],
+        energy: vec![0.0; ns],
+    };
+    calc_thermo(&species, temperature_k, ng, nc, true, &mut final_thermo);
+
+    let final_pressure_bar =
+        if const_p { state2 } else { 1e-5 * R_CEA * n * temperature_k / state2 };
+    let final_volume_m3_per_kg = if const_p {
+        R_CEA * n * temperature_k / (final_pressure_bar * 1e5)
+    } else {
+        state2
+    };
+
+    // I.1: reported mixture properties. Uses the LOG_MIN-mapped ("reporting")
+    // gas amounts (nj_stored, D.4-truncated), except entropy, which the
+    // guide explicitly calls out as using the raw log instead (below).
+    let sum_all: f64 =
+        nj_stored.iter().sum::<f64>() + active_condensed.iter().map(|&c| nj_c[c]).sum::<f64>();
+    let mut mole_fractions = vec![0.0; ns];
+    let mut mass_fractions = vec![0.0; ns];
+    let mut total_mass_flow: f64 =
+        (0..ng).map(|j| nj_stored[j] * species[j].data().mw()).sum();
+    total_mass_flow += active_condensed.iter().map(|&c| nj_c[c] * species[ng + c].data().mw()).sum::<f64>();
+    for j in 0..ng {
+        mole_fractions[j] = if sum_all > 0.0 { nj_stored[j] / sum_all } else { 0.0 };
+        mass_fractions[j] =
+            if total_mass_flow > 0.0 { nj_stored[j] * species[j].data().mw() / total_mass_flow } else { 0.0 };
+    }
+    for c in 0..nc {
+        mole_fractions[ng + c] = if sum_all > 0.0 { nj_c[c] / sum_all } else { 0.0 };
+        mass_fractions[ng + c] = if total_mass_flow > 0.0 {
+            nj_c[c] * species[ng + c].data().mw() / total_mass_flow
+        } else {
+            0.0
+        };
+    }
+
+    let enthalpy_kj_per_kg = ((0..ng).map(|j| nj_stored[j] * final_thermo.enthalpy[j]).sum::<f64>()
+        + active_condensed.iter().map(|&c| nj_c[c] * final_thermo.enthalpy[ng + c]).sum::<f64>())
+        * R_CEA
+        * temperature_k
+        / 1000.0;
+    let energy_kj_per_kg = enthalpy_kj_per_kg - n * R_CEA * temperature_k / 1000.0;
+
+    // S uses RAW ln_nj (guide's I.1 note): any species that survived the
+    // D.4 truncation map (nj_stored[j] > 0) contributes its true log.
+    let ln_p_over_n_final = (final_pressure_bar / n).ln();
+    let gas_s: f64 = (0..ng)
+        .filter(|&j| nj_stored[j] > 0.0)
+        .map(|j| nj_stored[j] * (final_thermo.entropy[j] - ln_nj[j] - ln_p_over_n_final))
+        .sum();
+    let cond_s: f64 =
+        active_condensed.iter().map(|&c| nj_c[c] * final_thermo.entropy[ng + c]).sum();
+    let entropy_kj_per_kg_k = R_CEA / 1000.0 * (gas_s + cond_s);
+    let gibbs_kj_per_kg = enthalpy_kj_per_kg - temperature_k * entropy_kj_per_kg_k;
+
+    let molar_mass_kg_per_kmol = 1.0 / n;
+    let active_cond_mole_frac: f64 = active_condensed.iter().map(|&c| mole_fractions[ng + c]).sum();
+    let mean_molecular_weight_kg_per_kmol = (1.0 - active_cond_mole_frac) / n;
+
+    let cp_frozen_kj_per_kg_k = ((0..ng).map(|j| nj_stored[j] * final_thermo.cp[j]).sum::<f64>()
+        + active_condensed.iter().map(|&c| nj_c[c] * final_thermo.cp[ng + c]).sum::<f64>())
+        * R_CEA
+        / 1000.0;
+    let cv_frozen_kj_per_kg_k = cp_frozen_kj_per_kg_k - n * R_CEA / 1000.0;
+
+    // I.2: equilibrium partials — two linear systems sharing the converged
+    // matrix's LHS (element rows + condensed rows + moles row, always
+    // ne_active+na+1 equations regardless of the problem's const_p/const_t
+    // flags — this analysis always differentiates w.r.t. lnT at fixed P and
+    // w.r.t. lnP at fixed T) built from UNTRUNCATED current nj (raw
+    // exp(ln_nj), not nj_stored).
+    let nj_raw: Vec<f64> = (0..ng).map(|j| ln_nj[j].exp()).collect();
+    let neq2 = ne_active + na + 1;
+    let cond_col2 = |idx: usize| ne_active + idx;
+    let lnn_col2 = ne_active + na;
+
+    let mut lhs = DMatrix::<f64>::zeros(neq2, neq2);
+    for (row_idx, &k) in active_elements.iter().enumerate() {
+        let tmp: Vec<f64> = (0..ng).map(|j| nj_raw[j] * stoich[j][k]).collect();
+        for (col_idx, &i) in active_elements.iter().enumerate() {
+            lhs[(row_idx, col_idx)] = (0..ng).map(|j| tmp[j] * stoich[j][i]).sum::<f64>();
+        }
+        for (idx, &c) in active_condensed.iter().enumerate() {
+            let a_kc = stoich[ng + c][k];
+            lhs[(row_idx, cond_col2(idx))] = a_kc;
+            lhs[(cond_col2(idx), row_idx)] = a_kc;
+        }
+        lhs[(row_idx, lnn_col2)] = tmp.iter().sum::<f64>();
+        lhs[(lnn_col2, row_idx)] = lhs[(row_idx, lnn_col2)];
+    }
+    let n_delta_raw = n - nj_raw.iter().sum::<f64>();
+    lhs[(lnn_col2, lnn_col2)] = -n_delta_raw;
+
+    let mut rhs_t = vec![0.0; neq2];
+    for (row_idx, &k) in active_elements.iter().enumerate() {
+        rhs_t[row_idx] =
+            -(0..ng).map(|j| stoich[j][k] * nj_raw[j] * final_thermo.enthalpy[j]).sum::<f64>();
+    }
+    for (idx, &c) in active_condensed.iter().enumerate() {
+        rhs_t[cond_col2(idx)] = -final_thermo.enthalpy[ng + c];
+    }
+    let sum_nj_hj_raw: f64 = (0..ng).map(|j| nj_raw[j] * final_thermo.enthalpy[j]).sum();
+    rhs_t[lnn_col2] = -sum_nj_hj_raw;
+
+    let mut rhs_p = vec![0.0; neq2];
+    for (row_idx, &k) in active_elements.iter().enumerate() {
+        rhs_p[row_idx] = (0..ng).map(|j| stoich[j][k] * nj_raw[j]).sum::<f64>();
+    }
+    rhs_p[lnn_col2] = nj_raw.iter().sum::<f64>();
+
+    let solve_partial = |rhs: &[f64]| -> Option<DVector<f64>> {
+        if neq2 == 0 {
+            return Some(DVector::zeros(0));
+        }
+        let mut g = DMatrix::<f64>::zeros(neq2, neq2 + 1);
+        g.view_mut((0, 0), (neq2, neq2)).copy_from(&lhs);
+        for i in 0..neq2 {
+            g[(i, neq2)] = rhs[i];
+        }
+        gauss(&mut g).ok()?;
+        Some(DVector::from_fn(neq2, |i, _| g[(i, neq2)]))
+    };
+
+    let sol_t = solve_partial(&rhs_t);
+    let sol_p = solve_partial(&rhs_p);
+
+    let (dlnv_dlnt, dlnv_dlnp, cp_eq_over_r) = match (&sol_t, &sol_p) {
+        (Some(st), Some(sp)) => {
+            let dlnn_dlnt = st[lnn_col2];
+            let dlnn_dlnp = sp[lnn_col2];
+            let dlnv_dlnt = 1.0 + dlnn_dlnt;
+            let dlnv_dlnp = -1.0 + dlnn_dlnp;
+
+            let term1: f64 = active_elements
+                .iter()
+                .enumerate()
+                .map(|(row_idx, &k)| {
+                    let sum_akj_nj_hj: f64 = (0..ng)
+                        .map(|j| stoich[j][k] * nj_raw[j] * final_thermo.enthalpy[j])
+                        .sum();
+                    sum_akj_nj_hj * st[row_idx]
+                })
+                .sum();
+            let term2: f64 = active_condensed
+                .iter()
+                .enumerate()
+                .map(|(idx, &c)| final_thermo.enthalpy[ng + c] * st[cond_col2(idx)])
+                .sum();
+            let term3 = sum_nj_hj_raw * dlnn_dlnt;
+            let term4 = (0..ng).map(|j| nj_raw[j] * final_thermo.cp[j]).sum::<f64>()
+                + active_condensed.iter().map(|&c| nj_c[c] * final_thermo.cp[ng + c]).sum::<f64>();
+            let term5 =
+                (0..ng).map(|j| nj_raw[j] * final_thermo.enthalpy[j].powi(2)).sum::<f64>();
+
+            (dlnv_dlnt, dlnv_dlnp, term1 + term2 + term3 + term4 + term5)
+        }
+        // I.3's degrade-gracefully fallback ("never a hard failure"): a
+        // singular partials system falls back to the ideal-gas-like
+        // constants plus I.1's own frozen-cp fallback formula.
+        _ => (1.0, -1.0, cp_frozen_kj_per_kg_k * 1000.0 / R_CEA),
+    };
+
+    let gamma_s = -1.0 / (dlnv_dlnp + dlnv_dlnt * dlnv_dlnt * n / cp_eq_over_r);
+    let cv_eq_over_r = -cp_eq_over_r / (gamma_s * dlnv_dlnp);
+    let cp_eq_kj_per_kg_k = cp_eq_over_r * R_CEA / 1000.0;
+    let cv_eq_kj_per_kg_k = cv_eq_over_r * R_CEA / 1000.0;
+
+    // D.7's final reporting map: species below LOG_MIN are reported as
+    // exactly 0 rather than denormal-ish exp() values.
+    let nj: Vec<f64> = (0..ng)
+        .map(|j| if ln_nj[j] > -87.0 { ln_nj[j].exp() } else { 0.0 })
+        .collect();
     TpSolveDebug {
         assembled_first_iteration: assembled_first_iteration
             .expect("MAX_TOTAL_ITERATIONS > 0, so iteration 0 always runs"),
@@ -988,6 +1605,23 @@ fn solve_for_products(
         condensed_nj: nj_c,
         gas_species: species[..ng].to_vec(),
         condensed_species: species[ng..].to_vec(),
+        pressure_bar: final_pressure_bar,
+        volume_m3_per_kg: final_volume_m3_per_kg,
+        enthalpy_kj_per_kg,
+        energy_kj_per_kg,
+        entropy_kj_per_kg_k,
+        gibbs_kj_per_kg,
+        molar_mass_kg_per_kmol,
+        mean_molecular_weight_kg_per_kmol,
+        cp_frozen_kj_per_kg_k,
+        cv_frozen_kj_per_kg_k,
+        cp_eq_kj_per_kg_k,
+        cv_eq_kj_per_kg_k,
+        gamma_s,
+        gas_mole_fractions: mole_fractions[..ng].to_vec(),
+        condensed_mole_fractions: mole_fractions[ng..].to_vec(),
+        gas_mass_fractions: mass_fractions[..ng].to_vec(),
+        condensed_mass_fractions: mass_fractions[ng..].to_vec(),
     }
 }
 
@@ -1719,6 +2353,8 @@ mod f_condensed_validation {
 
         // --- Check 2: Lagrangian stationarity, gas AND condensed ---
         // mu_j/RT for every gas species actually present in the solution.
+        // Species reported as exactly 0 (below the D.7 LOG_MIN cutoff) have
+        // no defined mu and are skipped below.
         let mu_gas: Vec<f64> = (0..result.gas_species.len())
             .map(|j| {
                 let d = result.gas_species[j].data();
@@ -1737,7 +2373,7 @@ mod f_condensed_validation {
             .flat_map(|i| (0..stoich_gas.len()).map(move |j| (i, j)))
             .find(|&(i, j)| {
                 let ((c1, o1), (c2, o2)) = (stoich_gas[i], stoich_gas[j]);
-                (c1 * o2 - c2 * o1).abs() > 1e-9
+                result.nj[i] > 0.0 && result.nj[j] > 0.0 && (c1 * o2 - c2 * o1).abs() > 1e-9
             })
             .expect("need two gas species with independent C/O stoichiometry");
         let ((c1, o1), (c2, o2)) = (stoich_gas[i1], stoich_gas[i2]);
@@ -1746,6 +2382,9 @@ mod f_condensed_validation {
         let pi_o = (c1 * mu_gas[i2] - c2 * mu_gas[i1]) / det;
 
         for j in 0..result.gas_species.len() {
+            if result.nj[j] == 0.0 {
+                continue; // below LOG_MIN reporting cutoff — no defined mu
+            }
             let (c, o) = stoich_gas[j];
             let predicted = c * pi_c + o * pi_o;
             assert!(
@@ -1964,6 +2603,129 @@ mod h_ions_validation {
 }
 
 #[cfg(test)]
+mod i_postprocess_validation {
+    //! Section I validation. No guide-provided ground truth exists for I.1's
+    //! reported properties or I.2's equilibrium partials, so instead this
+    //! checks physical invariants and cross-validates against independent
+    //! finite-difference derivatives computed from already-validated solves
+    //! (Section E's HP/SP/SV cases):
+    //!   1. Mole/mass fractions sum to 1.
+    //!   2. HP's own conserved quantity: I.1's reported enthalpy must equal
+    //!      the reactants' enthalpy (state1*R) — this is exactly what HP's
+    //!      Newton solve enforces, checked here via the independent I.1
+    //!      post-processing path rather than any of the solver's internal
+    //!      state.
+    //!   3. cp_eq (I.2): central finite difference of I.1's H over two
+    //!      nearby TP solves (same P) must match the analytic cp_eq at the
+    //!      midpoint solve.
+    //!   4. gamma_s (I.2): central finite difference of ln P over ln V from
+    //!      two nearby SV solves (same S) must match the analytic gamma_s at
+    //!      the midpoint solve.
+    use super::*;
+
+    fn h2_o2_reactants() -> [(f64, Species); 2] {
+        let of_ratio = 15.87336;
+        let mw_h2 = Species::H2.data().mw();
+        let mw_o2 = Species::O2.data().mw();
+        [(1.0 / mw_h2, Species::H2), (of_ratio / mw_o2, Species::O2)]
+    }
+
+    fn only_h2_o2_products() -> [Species; 6] {
+        [Species::H, Species::H2, Species::H2O, Species::O, Species::O2, Species::OH]
+    }
+
+    #[test]
+    fn fractions_sum_to_one_and_hp_conserves_enthalpy() {
+        let reactants = h2_o2_reactants();
+        let only = only_h2_o2_products();
+        let state1 = reactant_enthalpy_over_r(&reactants, 2000.0);
+
+        let result =
+            solve_for_products(&reactants, false, false, true, state1, 1.01325, false, false, Some(&only));
+        assert!(result.converged);
+
+        let mole_sum: f64 = result.gas_mole_fractions.iter().sum::<f64>()
+            + result.condensed_mole_fractions.iter().sum::<f64>();
+        assert!((mole_sum - 1.0).abs() < 1e-9, "mole fractions sum to {mole_sum}, expected 1");
+
+        let mass_sum: f64 = result.gas_mass_fractions.iter().sum::<f64>()
+            + result.condensed_mass_fractions.iter().sum::<f64>();
+        assert!((mass_sum - 1.0).abs() < 1e-9, "mass fractions sum to {mass_sum}, expected 1");
+
+        const R_CEA: f64 = 8314.51;
+        let expected_h_kj_per_kg = state1 * R_CEA / 1000.0;
+        assert!(
+            (result.enthalpy_kj_per_kg - expected_h_kj_per_kg).abs()
+                < 1e-4 * expected_h_kj_per_kg.abs(),
+            "I.1 H = {} kJ/kg, expected (HP-conserved) {} kJ/kg",
+            result.enthalpy_kj_per_kg,
+            expected_h_kj_per_kg
+        );
+    }
+
+    #[test]
+    fn cp_eq_matches_finite_difference_of_enthalpy_over_t() {
+        let reactants = h2_o2_reactants();
+        let only = only_h2_o2_products();
+        let t0 = 3181.2589964650856; // J.1's converged HP temperature
+        let p = 1.01325;
+        let dt = 0.5;
+
+        let solve_at = |t: f64| {
+            solve_for_products(&reactants, true, false, true, t, p, false, false, Some(&only))
+        };
+        let mid = solve_at(t0);
+        let minus = solve_at(t0 - dt);
+        let plus = solve_at(t0 + dt);
+        assert!(mid.converged && minus.converged && plus.converged);
+
+        let cp_findiff = (plus.enthalpy_kj_per_kg - minus.enthalpy_kj_per_kg) / (2.0 * dt);
+        assert!(
+            (mid.cp_eq_kj_per_kg_k - cp_findiff).abs() < 1e-2 * cp_findiff.abs(),
+            "cp_eq = {}, finite-difference dH/dT = {}",
+            mid.cp_eq_kj_per_kg_k,
+            cp_findiff
+        );
+    }
+
+    #[test]
+    fn gamma_s_matches_finite_difference_of_lnp_over_lnv() {
+        // Equimolar H2/O2, matching J.4's SV problem (state1 = 1.804 is the
+        // entropy target for THIS mixture; equal-mass amounts here would
+        // drive T below CEA's 160 K validity floor and fail the G.1 bounds
+        // check).
+        let reactants = [(1.0, Species::H2), (1.0, Species::O2)];
+        let only = only_h2_o2_products();
+        let s_over_r = 1.804; // J.4's SV state1
+        let v0 = 1.0 / 0.072081; // J.4's SV converged volume
+        let eps = 1e-4;
+
+        let solve_at = |v: f64| {
+            solve_for_products(&reactants, false, true, false, s_over_r, v, false, false, Some(&only))
+        };
+        let mid = solve_at(v0);
+        let minus = solve_at(v0 * (1.0 - eps));
+        let plus = solve_at(v0 * (1.0 + eps));
+        assert!(
+            mid.converged && minus.converged && plus.converged,
+            "converged: mid={} (T={}, iters={}), minus={} (T={}, iters={}), plus={} (T={}, iters={})",
+            mid.converged, mid.temperature_k, mid.iterations_used,
+            minus.converged, minus.temperature_k, minus.iterations_used,
+            plus.converged, plus.temperature_k, plus.iterations_used,
+        );
+
+        let gamma_findiff = -(plus.pressure_bar.ln() - minus.pressure_bar.ln())
+            / (plus.volume_m3_per_kg.ln() - minus.volume_m3_per_kg.ln());
+        assert!(
+            (mid.gamma_s - gamma_findiff).abs() < 1e-3 * gamma_findiff.abs(),
+            "gamma_s = {}, finite-difference -dlnP/dlnV = {}",
+            mid.gamma_s,
+            gamma_findiff
+        );
+    }
+}
+
+#[cfg(test)]
 mod cea_validation {
     //! test_h2_o2 (CEA_RUST_PORT_GUIDE.md Section J.1): H2/O2 at
     //! O/F mass ratio 15.87336. b0 computed independently in Python from
@@ -1996,3 +2758,116 @@ mod cea_validation {
         );
     }
 }
+
+#[cfg(test)]
+mod tp_stability_suite {
+    //! Same stability sweep as thermo::mixture::tests::solve_for_products_stability
+    //! (16 reactant mixtures x 15 (T, P) conditions, all solved as TP), ported
+    //! over so the two solvers' convergence behavior can be compared directly
+    //! on identical inputs. Reports the same per-condition/per-scenario grid;
+    //! unlike mixture.rs's version this doesn't hard-fail on <100% — it's
+    //! diagnostic (run with `-- --nocapture` to see the grid), since we don't
+    //! yet know what pass rate to expect from the new solver.
+    use super::*;
+
+    fn reactant_scenarios() -> Vec<Vec<(f64, Species)>> {
+        vec![
+            vec![(1.0, Species::H2O)],
+            vec![(1.0, Species::CH4)],
+            vec![(1.0, Species::CH4), (2.0, Species::O2)],
+            vec![(1.0, Species::CH4), (1.0, Species::O)],
+            vec![(1.0, Species::CH4), (1.0, Species::HPlus), (1.0, Species::OHNeg)],
+            vec![(1.0, Species::N2)],
+            vec![(1.0, Species::O2)],
+            vec![(1.0, Species::CO2)],
+            vec![(1.0, Species::NH3)],
+            vec![(2.0, Species::H2), (1.0, Species::O2)],
+            vec![(1.0, Species::CO), (1.0, Species::H2O)],
+            vec![(1.0, Species::N2), (3.0, Species::H2)],
+            vec![(1.0, Species::CO2), (1.0, Species::H2)],
+            vec![(2.0, Species::NH3), (1.5, Species::O2)],
+            vec![(1.0, Species::N2), (1.0, Species::O2), (1.0, Species::H2O)],
+            vec![(1.0, Species::E), (1.0, Species::HPlus)],
+        ]
+    }
+
+    fn conditions() -> Vec<(f64, f64)> {
+        vec![
+            (300.0, 1.0),
+            (300.0, 50.0),
+            (500.0, 50.0),
+            (1_000.0, 1.0),
+            (1_000.0, 50.0),
+            (2_000.0, 50.0),
+            (3_000.0, 50.0),
+            (4_000.0, 50.0),
+            (5_000.0, 1.0),
+            (5_000.0, 50.0),
+            (5_000.0, 200.0),
+            (7_000.0, 50.0),
+            (10_000.0, 50.0),
+            (15_000.0, 50.0),
+            (20_000.0, 50.0),
+        ]
+    }
+
+    #[test]
+    fn solve_for_products_stability() {
+        let reactants_list = reactant_scenarios();
+        let conditions = conditions();
+        let mut pass_fail = vec![vec![false; reactants_list.len()]; conditions.len()];
+
+        for (i, &(temperature_k, pressure_bar)) in conditions.iter().enumerate() {
+            for (j, reactants) in reactants_list.iter().enumerate() {
+                let result = solve_for_products(
+                    reactants,
+                    true,  // const_t: TP
+                    false, // const_s: unused for TP
+                    true,  // const_p: TP
+                    temperature_k,
+                    pressure_bar,
+                    true, // include_condensed, matching mixture.rs's always-built condensed pool
+                    true, // include_ions, matching mixture.rs's always-included E in element_pool
+                    None,
+                );
+                pass_fail[i][j] = result.converged;
+                if !result.converged {
+                    println!(
+                        "[debug] FAILED reactants={:?} T={:.1} P={:.1}",
+                        reactants
+                            .iter()
+                            .map(|(n, s)| format!("{:.1}*{}", n, s.data().symbol()))
+                            .collect::<Vec<_>>(),
+                        temperature_k,
+                        pressure_bar
+                    );
+                }
+            }
+        }
+
+        println!("========== Summary (equilibrium.rs TP solver) ==========");
+        for (i, &(temperature_k, pressure_bar)) in conditions.iter().enumerate() {
+            let total = pass_fail[i].len();
+            let passed = pass_fail[i].iter().filter(|&&x| x).count();
+            let row_header = format!("({:.1} K; {:.1} bar) Results:", temperature_k, pressure_bar);
+            println!(
+                "{:>30} [{}/{}] {:.2}%",
+                row_header,
+                passed,
+                total,
+                100.0 * (passed as f64 / total as f64)
+            );
+        }
+        let total_passed: usize = pass_fail.iter().map(|row| row.iter().filter(|&&x| x).count()).sum();
+        let total = conditions.len() * reactants_list.len();
+        println!(
+            "========== Overall: {}/{} ({:.2}%) ==========",
+            total_passed,
+            total,
+            100.0 * total_passed as f64 / total as f64
+        );
+    }
+}
+
+
+
