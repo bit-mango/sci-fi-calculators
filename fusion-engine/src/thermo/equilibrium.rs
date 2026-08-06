@@ -362,8 +362,35 @@ fn check_condensed_phases(
 // unused_assignments: pi_e's zeroing/accumulation sites mirror CEA's control
 // flow literally (guide H.2's ⚠ note); some are dead under H.3's overwrite,
 // exactly as in the Fortran.
-#[allow(unused_assignments, clippy::too_many_arguments)]
+// No-insert convenience wrapper; only the tests call it, hence dead_code.
+#[allow(dead_code, clippy::too_many_arguments)]
 fn solve_for_products_debug(
+    reactants: &[(f64, Species)],
+    const_t: bool,
+    const_s: bool,
+    const_p: bool,
+    state1: f64,
+    state2: f64,
+    include_condensed: bool,
+    include_ions: bool,
+    only: Option<&[Species]>,
+) -> EquilibriumDebug {
+    solve_for_products_debug_seeded(
+        reactants,
+        const_t,
+        const_s,
+        const_p,
+        state1,
+        state2,
+        include_condensed,
+        include_ions,
+        only,
+        None,
+    )
+}
+
+#[allow(unused_assignments, clippy::too_many_arguments)]
+fn solve_for_products_debug_seeded(
     reactants: &[(f64, Species)],
     // Section E.1: which state1/state2 pair this problem fixes. Only 't'
     // (TP), 'h' (HP), and 's' (SP) are implemented so far — TV/UV/SV need
@@ -388,6 +415,11 @@ fn solve_for_products_debug(
     // pool. Mainly for tests, where the ground truth was computed for a
     // specific, curated product list.
     only: Option<&[Species]>,
+    // F.5: condensed species to pre-activate (CEA's `insert` keyword), for
+    // problems where a condensed product dominates and the gas-only first
+    // convergence is pathological (e.g. metal combustion, where the T Newton
+    // crashes before any condensed insertion can happen).
+    insert: Option<&[Species]>,
 ) -> EquilibriumDebug {
     let mut constituent_set: HashSet<Constituent> = HashSet::new();
     reactants.iter().for_each(|(_, parent_species)| {
@@ -526,6 +558,19 @@ fn solve_for_products_debug(
     // — this ordering decides matrix row order and therefore how a singular
     // ierr in the condensed block maps back to a species (G.2c / AI.1.2).
     let mut active_ranked: Vec<usize> = Vec::new();
+    // F.5: pre-activate the caller's insert list with nj = 0 (keeps the
+    // nj_c/is_active invariant above). Non-condensed or out-of-pool entries
+    // are ignored.
+    if let Some(seeds) = insert {
+        for seed in seeds {
+            if let Some(c) = species[ng..].iter().position(|s| s == seed)
+                && !is_active[c]
+            {
+                is_active[c] = true;
+                active_ranked.insert(0, c);
+            }
+        }
+    }
     // F.4 phase-transition bookkeeping: the phase most recently swapped out
     // (re-encountering it means melting-point coexistence), and the pinned
     // solid+liquid pair at a melting point.
@@ -1711,12 +1756,16 @@ fn solve_for_products_debug(
 /// * `include_condensed` - Include condensed (solid/liquid) species
 /// * `include_ions` - Include ionic species
 /// * `only` - Restrict products to this list, or None for auto-generated pool
+/// * `insert` - Condensed species to pre-activate (CEA's `insert` keyword);
+///   use when a condensed product dominates (e.g. metal oxides) and the
+///   gas-only first convergence fails
 pub fn solve_for_products(
     reactants: &[(f64, Species)],
     mode: EquilibriumMode,
     include_condensed: bool,
     include_ions: bool,
     only: Option<&[Species]>,
+    insert: Option<&[Species]>,
 ) -> Result<EquilibriumState, EquilibriumError> {
     // Unpack mode into internal parameters
     let (const_t, const_s, const_p, state1, state2) = match mode {
@@ -1746,7 +1795,7 @@ pub fn solve_for_products(
         } => (false, true, false, s_over_r, volume_m3_per_kg),
     };
 
-    let debug_result = solve_for_products_debug(
+    let debug_result = solve_for_products_debug_seeded(
         reactants,
         const_t,
         const_s,
@@ -1756,6 +1805,7 @@ pub fn solve_for_products(
         include_condensed,
         include_ions,
         only,
+        insert,
     );
 
     if debug_result.converged {
@@ -2008,6 +2058,7 @@ mod d5_convergence_validation {
             false,
             false,
             Some(&only),
+            None,
         )
         .expect("TP solve should converge");
 
@@ -2224,6 +2275,7 @@ mod e_sp_validation {
             false,
             false,
             Some(&only),
+            None,
         )
         .expect("SP solve should converge");
 

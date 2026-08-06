@@ -28,6 +28,7 @@ impl Mixture {
             true,
             true,
             None,
+            None,
         );
         match result {
             Ok(state) => {
@@ -58,6 +59,51 @@ impl Mixture {
                     panic!("Failed to converge in {} iterations!", iterations_used);
                 }
             },
+        }
+    }
+
+    /// Adiabatic flame state: HP solve at the reactants' enthalpy evaluated
+    /// at `t_initial` (the propellant storage temperature). `insert`
+    /// pre-activates condensed species (CEA's `insert` keyword) — required
+    /// when a condensed product dominates, e.g. MgO(cr) for metal fuels,
+    /// or the gas-only solve crashes the temperature toward 0 K.
+    pub fn new_adiabatic(
+        reactants: &[(f64, Species)],
+        t_initial: f64,
+        pressure_bar: f64,
+        insert: Option<&[Species]>,
+    ) -> Self {
+        let h: f64 = reactants
+            .iter()
+            .map(|(x, sp)| x * sp.data().h_over_r(t_initial))
+            .sum();
+        let mass: f64 = reactants.iter().map(|(x, sp)| x * sp.data().mw()).sum();
+
+        let state = solve_for_products(
+            reactants,
+            EquilibriumMode::HP {
+                h_over_r: h / mass,
+                pressure_bar,
+            },
+            true,
+            true,
+            None,
+            insert,
+        )
+        .expect("HP solve should converge.");
+
+        let (h_total, s_total, n_total, avg_mw, avg_cp) =
+            Self::state(&state.products, state.temperature_k, pressure_bar);
+
+        Self {
+            products: state.products,
+            temperature_k: state.temperature_k,
+            pressure_bar: state.pressure_bar,
+            h_total,
+            s_total,
+            n_total,
+            avg_mw,
+            avg_cp,
         }
     }
 
@@ -195,6 +241,7 @@ impl Mixture {
             true,
             true,
             None,
+            None,
         );
 
         match result {
@@ -215,7 +262,10 @@ impl Mixture {
             }
             Err(err) => match err {
                 EquilibriumError::FailedToConverge { iterations_used } => {
-                    panic!("mix() failed to converge after {} iterations", iterations_used)
+                    panic!(
+                        "mix() failed to converge after {} iterations",
+                        iterations_used
+                    )
                 }
             },
         }
@@ -237,6 +287,4 @@ impl Mixture {
             .sum()
     }
 }
-
-
 

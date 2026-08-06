@@ -77,6 +77,7 @@ fn solve_for_chamber_state(q_chamber: f64, ions: &Mixture, diluent: Option<&Mixt
         true,
         true,
         None,
+        None,
     );
 
     match result {
@@ -122,6 +123,7 @@ fn expand_to_exit(chamber: &Mixture, exit_pressure_bar: f64) -> Mixture {
         },
         true,
         true,
+        None,
         None,
     );
     match result {
@@ -196,8 +198,10 @@ fn calculate_engine_output(
     // Start with CH4 + H20 ion feeds.
     let mut total_energy_in_per_ions_mole = 0.0;
 
-    // CH4 + H2O => CH5+ + OH-
-    total_energy_in_per_ions_mole += CH4_PARTIAL_OXIDATION_ENERGY;
+    // Cost of creating the CH4+/O- pair from neutrals: ionize CH4, park the
+    // electron on O (which gives a little back). Recovered in q_chamber when
+    // the pair neutralizes.
+    total_energy_in_per_ions_mole += CH4_FIRST_IONIZATION - O_ELECTRON_AFFINITY;
 
     // Now each species is accelerated using an electric field.
     let electrostatic_energy = F * (2.0 * field_voltage);
@@ -239,9 +243,12 @@ fn calculate_engine_output(
     // Assume all products start at room temperature.
     // Heat for the accelerated species that hit eachother and react, but do not
     // hit any other chamber species.
-    let q_chamber = electrostatic_energy * collision_theta_rad.sin().powi(2)
-        + CH4_PARTIAL_OXIDATION_ENERGY
-        + CH4_FIRST_IONIZATION;
+    // No manual reaction-energy term: the feed enters frozen (CH4 + O), so
+    // the chamber HP solve releases combustion energy exactly from the
+    // formation enthalpies. Only what the thermo data can't know is added:
+    // thermalized beam KE and the CH4+/O- neutralization release (IE - EA).
+    let q_chamber = electrostatic_energy * collision_theta_rad.sin().powi(2) + CH4_FIRST_IONIZATION
+        - O_ELECTRON_AFFINITY;
     let q_chamber_plasma = q_chamber * (1.0 - coupling_efficiency); // J/mol
     //  Heat for the accelerated species that hit eachother and react, then
     // fully mix with other chamber species.
@@ -472,13 +479,36 @@ pub fn sweep_engine() {
     let aperture_diameter = 0.5e-3;
     let funnel_length = 3.0; // meters
     let chamber_pressure = 10.0;
-    let collision_theta_deg = 15.0;
+    let collision_theta_deg = 20.0;
 
-    let ions = Mixture::new(
+    // The beam is really CH4+ and O-, which the solver can't (and needn't)
+    // represent: it reduces the feed to elements, and CH4+ + O- has the same
+    // element vector and zero net charge as neutral CH4 + O. What matters is
+    // that the beam must NOT be pre-equilibrated (Mixture::new would burn it
+    // to C(gr) + H2O before the chamber): keep it frozen, and let the
+    // chamber's HP solve release the reaction energy from the formation
+    // enthalpies. The ionization offset is added manually via q_chamber.
+    let ions = Mixture::new_with_frozen_reactants(
         &[(1.0, species!("CH4")), (1.0, species!("O"))],
         273.0,
         chamber_pressure,
     );
+
+    // TODO mixutre has O3 in it for plasma which is non sensical, likely from an extrapolation of
+    // the polynomial coefficients far outside the max range of 6,000 K.
+
+    // t_initial is the storage temperature of the propellants (MgH2(b)'s fit
+    // only spans 300-600 K anyway — it decomposes well below 1000 K).
+    // MgO(cr) must be insert-seeded: the products are dominated by condensed
+    // MgO, and without it the gas-only HP solve crashes T toward 0 K.
+    let tmp = Mixture::new_adiabatic(
+        &[(1.0, species!("Mg")), (1.0, species!("H2O"))],
+        1_273.0,
+        chamber_pressure,
+        Some(&[species!("MgO(cr)")]), // Preactivates listed condensed species with nj = 0.
+    );
+    tmp.print_products();
+    todo!();
 
     let diluent = Mixture::new(
         &[(1.0, species!("H2")), (19.0, Species::H2O)],
