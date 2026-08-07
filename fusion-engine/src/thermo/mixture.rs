@@ -10,7 +10,6 @@ pub struct Mixture {
     pub temperature_k: f64,
     pub pressure_bar: f64,
     pub h_total: f64, // Total enthalpy.
-    #[allow(dead_code)]
     pub s_total: f64, // Total entropy.
     pub n_total: f64,
     pub avg_mw: f64,
@@ -62,6 +61,43 @@ impl Mixture {
         }
     }
 
+    pub fn with_isentropic_expansion(&self, expansion_pressure_bar: f64) -> Mixture {
+        let result = solve_for_products(
+            &self.products,
+            EquilibriumMode::SP {
+                // s_total is J/K on the self's mole basis; SP mode wants
+                // S/R per unit feed mass [K*kmol/kg = K*mol/g].
+                s_over_r: self.s_total / (R * self.feed_mass()),
+                pressure_bar: expansion_pressure_bar,
+            },
+            true,
+            true,
+            None,
+            None,
+        );
+        match result {
+            Ok(state) => {
+                let (h_total, s_total, n_total, avg_mw, avg_cp) =
+                    Mixture::state(&state.products, state.temperature_k, state.pressure_bar);
+                Mixture {
+                    products: state.products,
+                    temperature_k: state.temperature_k,
+                    pressure_bar: state.pressure_bar,
+                    h_total,
+                    s_total,
+                    n_total,
+                    avg_mw,
+                    avg_cp,
+                }
+            }
+            Err(EquilibriumError::FailedToConverge { iterations_used }) => {
+                panic!(
+                    "with_isentropic_expansion failed to converge after {iterations_used} iterations"
+                )
+            }
+        }
+    }
+
     /// Adiabatic flame state: HP solve at the reactants' enthalpy evaluated
     /// at `t_initial` (the propellant storage temperature). `insert`
     /// pre-activates condensed species (CEA's `insert` keyword) — required
@@ -104,6 +140,46 @@ impl Mixture {
             n_total,
             avg_mw,
             avg_cp,
+        }
+    }
+
+    /// Re-equilibrates the mixture after adding `q` joules of heat at
+    /// constant pressure. Uses HP mode so species can dissociate/recombine
+    /// as needed with the added heat.
+    pub fn with_heat_addition(&self, q: f64) -> Mixture {
+        let target_enthalpy = self.h_total + q; // J
+
+        // HP mode wants H/R per unit feed mass [K·kmol/kg = K·mol/g], not J.
+        let result = solve_for_products(
+            &self.products,
+            EquilibriumMode::HP {
+                h_over_r: target_enthalpy / (R * self.feed_mass()),
+                pressure_bar: self.pressure_bar,
+            },
+            true,
+            true,
+            None,
+            None,
+        );
+
+        match result {
+            Ok(state) => {
+                let (h_total, s_total, n_total, avg_mw, avg_cp) =
+                    Mixture::state(&state.products, state.temperature_k, state.pressure_bar);
+                Mixture {
+                    products: state.products,
+                    temperature_k: state.temperature_k,
+                    pressure_bar: state.pressure_bar,
+                    h_total,
+                    s_total,
+                    n_total,
+                    avg_mw,
+                    avg_cp,
+                }
+            }
+            Err(EquilibriumError::FailedToConverge { iterations_used }) => {
+                panic!("with_heat_addition failed to converge after {iterations_used} iterations")
+            }
         }
     }
 
@@ -175,10 +251,10 @@ impl Mixture {
     pub fn print_products(&self) {
         println!("Products Temperature: {:.3} K", self.temperature_k);
         for (mole, species) in self.products.iter() {
-            if *mole < 1.0e-6 {
+            if *mole < 1.0e-4 {
                 continue;
             }
-            println!("{:.6} {}", mole, species.data().symbol());
+            println!("{:.4} {}", mole, species.data().symbol());
         }
     }
 
@@ -287,4 +363,3 @@ impl Mixture {
             .sum()
     }
 }
-

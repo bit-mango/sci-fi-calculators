@@ -3,7 +3,6 @@ use crate::nozzle::area_ratio::exit_pressure_from_area_ratio;
 use std::f64::consts::PI;
 use thermo_species::{Species, species};
 
-use crate::thermo::equilibrium::{EquilibriumError, EquilibriumMode, solve_for_products};
 use crate::thermo::mixture::Mixture;
 
 fn required_max_channel_area(
@@ -63,88 +62,7 @@ fn solve_for_chamber_state(q_chamber: f64, ions: &Mixture, diluent: Option<&Mixt
     } else {
         ions.clone()
     };
-    let target_enthalpy = mixture.h_total + q_chamber; // J
-
-    // Use HP mode to reequilibrate at the new enthalpy and pressure.
-    // This allows species to dissociate/recombine as needed with the added heat.
-    // HP mode wants H/R per unit feed mass [K·kmol/kg = K·mol/g], not J.
-    let result = solve_for_products(
-        &mixture.products,
-        EquilibriumMode::HP {
-            h_over_r: target_enthalpy / (R * mixture.feed_mass()),
-            pressure_bar: mixture.pressure_bar,
-        },
-        true,
-        true,
-        None,
-        None,
-    );
-
-    match result {
-        Ok(state) => {
-            let (h_total, s_total, n_total, avg_mw, avg_cp) =
-                Mixture::state(&state.products, state.temperature_k, state.pressure_bar);
-
-            Mixture {
-                products: state.products,
-                temperature_k: state.temperature_k,
-                pressure_bar: state.pressure_bar,
-                h_total,
-                s_total,
-                n_total,
-                avg_mw,
-                avg_cp,
-            }
-        }
-        Err(err) => match err {
-            EquilibriumError::FailedToConverge { iterations_used } => {
-                panic!(
-                    "solve_for_chamber_state failed to converge after {} iterations",
-                    iterations_used
-                )
-            }
-        },
-    }
-}
-
-// Isentropic full-equilibrium expansion (CEA-style SP solve) from a chamber
-// state to the nozzle exit pressure. The frozen-gamma temperature estimate
-// breaks down for near-gamma=1 plasma: T barely drops across the nozzle and
-// low-pressure dissociation can push exit enthalpy above the chamber's,
-// making v_heat imaginary.
-fn expand_to_exit(chamber: &Mixture, exit_pressure_bar: f64) -> Mixture {
-    let result = solve_for_products(
-        &chamber.products,
-        EquilibriumMode::SP {
-            // s_total is J/K on the chamber's mole basis; SP mode wants
-            // S/R per unit feed mass [K*kmol/kg = K*mol/g].
-            s_over_r: chamber.s_total / (R * chamber.feed_mass()),
-            pressure_bar: exit_pressure_bar,
-        },
-        true,
-        true,
-        None,
-        None,
-    );
-    match result {
-        Ok(state) => {
-            let (h_total, s_total, n_total, avg_mw, avg_cp) =
-                Mixture::state(&state.products, state.temperature_k, state.pressure_bar);
-            Mixture {
-                products: state.products,
-                temperature_k: state.temperature_k,
-                pressure_bar: state.pressure_bar,
-                h_total,
-                s_total,
-                n_total,
-                avg_mw,
-                avg_cp,
-            }
-        }
-        Err(EquilibriumError::FailedToConverge { iterations_used }) => {
-            panic!("expand_to_exit failed to converge after {iterations_used} iterations")
-        }
-    }
+    mixture.with_heat_addition(q_chamber)
 }
 
 fn choked_throat_area(
@@ -274,7 +192,7 @@ fn calculate_engine_output(
     // Nozzle expansion. full equilibrium flow for upper bound Isp.
     let exit_temperature = chamber_plasma_state.temperature_k
         * (exit_pressure / chamber_pressure).powf((mixture_gamma - 1.0) / mixture_gamma);
-    let plasma_species = expand_to_exit(&chamber_plasma_state, exit_pressure);
+    let plasma_species = chamber_plasma_state.with_isentropic_expansion(exit_pressure);
     let plasma_species_low = Mixture::new_with_frozen_reactants(
         &chamber_plasma_state.products,
         exit_temperature,
@@ -329,7 +247,7 @@ fn calculate_engine_output(
     // Nozzle expansion. full equilibrium flow for upper bound Isp.
     let exit_temperature = chamber_diluent_state.temperature_k
         * (exit_pressure / chamber_pressure).powf((mixture_gamma - 1.0) / mixture_gamma);
-    let diluent_species = expand_to_exit(&chamber_diluent_state, exit_pressure);
+    let diluent_species = chamber_diluent_state.with_isentropic_expansion(exit_pressure);
     let diluent_species_low = Mixture::new_with_frozen_reactants(
         &chamber_diluent_state.products,
         exit_temperature,
@@ -501,14 +419,13 @@ pub fn sweep_engine() {
     // only spans 300-600 K anyway — it decomposes well below 1000 K).
     // MgO(cr) must be insert-seeded: the products are dominated by condensed
     // MgO, and without it the gas-only HP solve crashes T toward 0 K.
-    let tmp = Mixture::new_adiabatic(
-        &[(1.0, species!("Mg")), (1.0, species!("H2O"))],
-        1_273.0,
-        chamber_pressure,
-        Some(&[species!("MgO(cr)")]), // Preactivates listed condensed species with nj = 0.
-    );
-    tmp.print_products();
-    todo!();
+    // let tmp = Mixture::new_adiabatic(
+    //     &[(1.0, species!("Mg")), (1.0, species!("O2"))],
+    //     300.0,
+    //     chamber_pressure,
+    //     Some(&[species!("MgO(cr)")]), // Preactivates listed condensed species with nj = 0.
+    // );
+    // tmp.print_products();
 
     let diluent = Mixture::new(
         &[(1.0, species!("H2")), (19.0, Species::H2O)],
