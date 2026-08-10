@@ -3,7 +3,7 @@ use crate::nozzle::area_ratio::exit_pressure_from_area_ratio;
 use std::f64::consts::PI;
 use thermo_species::{Species, species};
 
-use crate::thermo::mixture::Mixture;
+use cea_rs::mixture::Mixture;
 
 fn required_max_channel_area(
     n_dot_reaction: f64,

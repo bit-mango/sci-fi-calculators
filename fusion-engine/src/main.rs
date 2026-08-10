@@ -21,7 +21,6 @@ mod constants;
 mod engine;
 mod hybrid_engine;
 mod nozzle;
-mod thermo;
 // use crate::engine::cooling::{
 //     calculate_heat_state, calculate_heat_state_ammonia, calculate_heat_state_urea,
 // };
