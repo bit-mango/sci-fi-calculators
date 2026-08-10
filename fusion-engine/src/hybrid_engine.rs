@@ -81,6 +81,79 @@ fn choked_chamber_pressure_bar(
     pressure_pa / 1.0e5
 }
 
+fn mixture_gamma(mixture: &Mixture) -> f64 {
+    let cp_mass_basis = mixture.avg_cp / mixture.avg_mw;
+    let specific_gas_constant = R / mixture.avg_mw;
+    cp_mass_basis / (cp_mass_basis - specific_gas_constant)
+}
+
+/// Expands `chamber_species` through the nozzle — both the equilibrium
+/// (shifting-composition) and frozen-flow (fixed-composition, lower bound)
+/// cases — and reports Isp/thrust for one flow path, prefixed with `label`
+/// (e.g. "Fast"/"Slow") in the printed report. `v_initial` is the
+/// pre-existing, non-thermal exit velocity component specific to that flow
+/// path (electrostatic beam velocity for the fast path, momentum-shared
+/// velocity for the slow path); `m_dot` is that path's mass flow. Returns
+/// the equilibrium-flow thrust, the only figure the caller needs back (for
+/// the combined-thrust total) — Isp and the frozen-flow lower bounds are
+/// only reported, not consumed further.
+#[allow(clippy::too_many_arguments)]
+fn nozzle_flow_performance(
+    label: &str,
+    chamber_species: &Mixture,
+    actual_chamber_pressure: f64,
+    target_area_ratio: f64,
+    v_initial: f64,
+    total_pool_mass: f64,
+    m_dot: f64,
+) -> f64 {
+    let gamma = mixture_gamma(chamber_species);
+
+    let exit_pressure =
+        exit_pressure_from_area_ratio(actual_chamber_pressure, target_area_ratio, gamma);
+
+    // Nozzle expansion. full equilibrium flow for upper bound Isp.
+    let exit_temperature = chamber_species.temperature_k
+        * (exit_pressure / actual_chamber_pressure).powf((gamma - 1.0) / gamma);
+    let expanded_species = chamber_species
+        .clone()
+        .with_equilibrium_expansion(exit_pressure, None, None)
+        .expect("Failed equilibrium expansion");
+    // Frozen-flow lower bound: composition fixed at the chamber's, only T/P
+    // update through the expansion.
+    let expanded_species_low =
+        Mixture::new(&chamber_species.products, exit_temperature, exit_pressure);
+
+    let v_heat =
+        (2.0 * (chamber_species.h_total - expanded_species.h_total) / total_pool_mass).sqrt();
+    let v_e = v_initial + v_heat;
+    let electrostatic_isp = v_initial / G_0;
+    let combustion_isp = v_heat / G_0;
+    let isp = electrostatic_isp + combustion_isp;
+    let thrust = v_e * m_dot;
+
+    let v_heat_low =
+        (2.0 * (chamber_species.h_total - expanded_species_low.h_total) / total_pool_mass).sqrt();
+    let v_e_low = v_initial + v_heat_low;
+    let combustion_isp_low = v_heat_low / G_0;
+    let isp_low = electrostatic_isp + combustion_isp_low;
+    let thrust_low = v_e_low * m_dot;
+
+    println!(
+        "[{label}] Chamber Temperature: {:.3} K",
+        chamber_species.temperature_k
+    );
+    chamber_species.print_products();
+    println!("[{label}] Electrostatic Isp: {:.0} s", electrostatic_isp);
+    println!("[{label}] Combustion Isp: {:.0} s", combustion_isp);
+    println!("[{label}] Isp: {:.0} s", isp);
+    println!("[{label}] Thrust: {:.3} kN", thrust / 1.0e3);
+    println!("[{label}] Lower Isp: {:.0} s", isp_low);
+    println!("[{label}] Lower Thrust: {:.3} kN", thrust_low / 1.0e3);
+
+    thrust
+}
+
 #[allow(clippy::too_many_arguments)]
 fn calculate_engine_output(
     field_voltage: f64,
@@ -89,10 +162,6 @@ fn calculate_engine_output(
     chamber_pressure: f64,
     target_area_ratio: f64,
     ions: &Mixture,
-    // Moles of CH5+/OH- pair units in the `ions` feed basis (the CH4 amount
-    // in its reactant list). Used to normalize `ions` to a per-pair basis so
-    // the J/mol energy terms below survive changes to the feed mole ratios.
-    ion_pair_moles: f64,
     // `diluent` amounts are interpreted per mole of ion pairs.
     diluent: &Mixture,
     gap_spacing: f64,
@@ -101,22 +170,15 @@ fn calculate_engine_output(
     coupling_efficiency: f64,
     fixed_total_throat_area: Option<f64>,
 ) -> (Option<f64>, Option<f64>) {
-    let ions = ions.clone().scale(1.0 / ion_pair_moles);
-
-    // Start with CH4 + H20 ion feeds.
-    let mut total_energy_in_per_ions_mole = 0.0;
-
     // Cost of creating the CH4+/O- pair from neutrals: ionize CH4, park the
     // electron on O (which gives a little back). Recovered in q_chamber when
     // the pair neutralizes.
-    total_energy_in_per_ions_mole += CH4_FIRST_IONIZATION - O_ELECTRON_AFFINITY;
+    let mut total_energy_in_per_ions_mole = CH4_FIRST_IONIZATION - O_ELECTRON_AFFINITY;
 
     // Now each species is accelerated using an electric field.
     let electrostatic_energy = F * (2.0 * field_voltage);
     total_energy_in_per_ions_mole += electrostatic_energy;
 
-    // This needs to account for the Hydrogen in the water, but this isn't very clean...
-    // TODO DOES THIS need H2 MW added?
     let ions_mw = ions.feed_mass() * 1.0e-3; // feed_mass is grams -> kg per mole of ion pairs
     let ions_n_dot = engine_power / total_energy_in_per_ions_mole;
     let ions_m_dot = ions_n_dot * ions_mw;
@@ -126,7 +188,6 @@ fn calculate_engine_output(
     // versus how much is carried through out the nozzle.
     // A theta of 90 deg is a head on collision, great reaction rate, but kinetic energy turns into heat.
     // A theta of 0 degrees means the species run parallel and have a poor reaction rate, but kinetic energy is retained.
-
     let collision_theta_rad = collision_theta_deg * PI / 180.0;
     let v_y = (2.0 * electrostatic_energy / ions_mw).sqrt() * collision_theta_rad.cos();
 
@@ -146,15 +207,7 @@ fn calculate_engine_output(
     let ke_dissipated = coupling_efficiency * ke_dissipated_full;
     let q_mixing = ke_dissipated / (coupling_efficiency * ions_n_dot); // J/mol, adds to q_chamber
 
-    // Any heat from collision plus reaction plus ionization. will go to raising the temperature of the products.
-    // Products are CO + 3H2 (H2 injected from water electrolysis).
-    // Assume all products start at room temperature.
-    // Heat for the accelerated species that hit eachother and react, but do not
-    // hit any other chamber species.
-    // No manual reaction-energy term: the feed enters frozen (CH4 + O), so
-    // the chamber HP solve releases combustion energy exactly from the
-    // formation enthalpies. Only what the thermo data can't know is added:
-    // thermalized beam KE and the CH4+/O- neutralization release (IE - EA).
+    // Any heat from collision plus reaction plus ionization. Will go to raising the temperature of the products.
     let q_chamber = electrostatic_energy * collision_theta_rad.sin().powi(2) + CH4_FIRST_IONIZATION
         - O_ELECTRON_AFFINITY;
     let q_chamber_plasma = q_chamber * (1.0 - coupling_efficiency); // J/mol
@@ -162,143 +215,42 @@ fn calculate_engine_output(
     // fully mix with other chamber species.
     let q_chamber_diluent = q_chamber * coupling_efficiency + q_mixing; // J/mol
 
-    let plasma = &ions;
+    let plasma = ions;
     let plasma_species = plasma.clone().scale(1.0 - coupling_efficiency);
-    let chamber_plasma_state = plasma_species
-        .with_heat_addition(q_chamber_plasma, None, None)
+    // TODO this is a bit hard-codey, but without restricting species set
+    // this solves using O3 which is non-sensical at 19,000 K it doesn't exist
+    // O3 is a massive endothermic sink that was stealing chamber temperature.
+    // So with this list we can lower theta dramatically.
+    let chamber_plasma_species = plasma_species
+        .with_heat_addition(
+            q_chamber_plasma,
+            Some(&vec![
+                species!("C"),
+                species!("C+"),
+                species!("e-"),
+                species!("H"),
+                species!("H-"),
+                species!("H+"),
+                species!("O"),
+                species!("O+"),
+                species!("O-"),
+                species!("O2"),
+            ]),
+            None,
+        )
         .expect("Failed to heat plasma species.");
     let diluent_species = plasma.clone().scale(coupling_efficiency);
     let diluent_mix = diluent_species
         .mix(diluent.clone())
         .expect("Failed to mix diliuent.");
-    let chamber_diluent_state = diluent_mix
+    let chamber_diluent_species = diluent_mix
         .with_heat_addition(q_chamber_diluent, None, None)
         .expect("Failed to heat dilunet");
-
-    // Handle fast flow.
-    // Mixture properties.
-    let mixture_cp_mass_basis = chamber_plasma_state.avg_cp / chamber_plasma_state.avg_mw;
-    let mixture_specific_gas_constant = R / chamber_plasma_state.avg_mw;
-    let mixture_gamma =
-        mixture_cp_mass_basis / (mixture_cp_mass_basis - mixture_specific_gas_constant);
-
-    let exit_pressure =
-        exit_pressure_from_area_ratio(chamber_pressure, target_area_ratio, mixture_gamma);
-
-    // Nozzle expansion. full equilibrium flow for upper bound Isp.
-    let exit_temperature = chamber_plasma_state.temperature_k
-        * (exit_pressure / chamber_pressure).powf((mixture_gamma - 1.0) / mixture_gamma);
-    let plasma_species = chamber_plasma_state
-        .clone()
-        .with_equilibrium_expansion(exit_pressure, None, None)
-        .expect("Failed equilibrium expansion");
-    let plasma_species_low = Mixture::new(
-        &chamber_plasma_state.products,
-        exit_temperature,
-        exit_pressure,
-    );
-    let total_pool_mass = ions_mw * (1.0 - coupling_efficiency);
-    // let total_pool_mass = propellant_mw + diluent.feed_mass();
-    let v_heat =
-        (2.0 * (chamber_plasma_state.h_total - plasma_species.h_total) / total_pool_mass).sqrt();
-    let v_e = v_y + v_heat;
-    let plasma_electrostatic_isp = v_y / G_0;
-    let plasma_combustion_isp = v_heat / G_0;
-    let plasma_isp = plasma_electrostatic_isp + plasma_combustion_isp;
-    let plasma_engine_thrust = v_e * (ions_m_dot * (1.0 - coupling_efficiency));
-
-    let v_heat_low = (2.0 * (chamber_plasma_state.h_total - plasma_species_low.h_total)
-        / total_pool_mass)
-        .sqrt();
-    let v_e_low = v_y + v_heat_low;
-    let plasma_combustion_isp_low = v_heat_low / G_0;
-    let plasma_isp_low = plasma_electrostatic_isp + plasma_combustion_isp_low;
-    let plasma_engine_thrust_low = v_e_low * (ions_m_dot * (1.0 - coupling_efficiency));
-
-    println!(
-        "[Fast] Chamber Plasma Temperature: {:.3} K",
-        chamber_plasma_state.temperature_k
-    );
-    chamber_plasma_state.print_products();
-    println!(
-        "[Fast] Electrostatic Isp: {:.0} s",
-        plasma_electrostatic_isp
-    );
-    println!("[Fast] Combustion Isp: {:.0} s", plasma_combustion_isp);
-    println!("[Fast] Isp: {:.0} s", plasma_isp);
-    println!("[Fast] Thrust: {:.3} kN", plasma_engine_thrust / 1.0e3);
-    println!("[Fast] Lower Isp: {:.0} s", plasma_isp_low);
-    println!(
-        "[Fast] Lower Thrust: {:.3} kN",
-        plasma_engine_thrust_low / 1.0e3
-    );
-
-    // Handle slow flow.
-    // Mixture properties.
-    let mixture_cp_mass_basis = chamber_diluent_state.avg_cp / chamber_diluent_state.avg_mw;
-    let mixture_specific_gas_constant = R / chamber_diluent_state.avg_mw;
-    let mixture_gamma =
-        mixture_cp_mass_basis / (mixture_cp_mass_basis - mixture_specific_gas_constant);
-
-    let exit_pressure =
-        exit_pressure_from_area_ratio(chamber_pressure, target_area_ratio, mixture_gamma);
-
-    // Nozzle expansion. full equilibrium flow for upper bound Isp.
-    let exit_temperature = chamber_diluent_state.temperature_k
-        * (exit_pressure / chamber_pressure).powf((mixture_gamma - 1.0) / mixture_gamma);
-    let diluent_species = chamber_diluent_state
-        .clone()
-        .with_equilibrium_expansion(exit_pressure, None, None)
-        .expect("Failed equilibrium expansion");
-    let diluent_species_low = Mixture::new(
-        &chamber_diluent_state.products,
-        exit_temperature,
-        exit_pressure,
-    );
-    let total_pool_mass = ions_mw * coupling_efficiency + diluent.feed_mass() * 1.0e-3; // kg
-    let v_heat =
-        (2.0 * (chamber_diluent_state.h_total - diluent_species.h_total) / total_pool_mass).sqrt();
-    let v_e = v_common + v_heat;
-    let slow_electrostatic_isp = v_common / G_0;
-    let slow_combustion_isp = v_heat / G_0;
-    let slow_isp = slow_electrostatic_isp + slow_combustion_isp;
-    let slow_engine_thrust = v_e * (ions_m_dot * coupling_efficiency + diluent_m_dot);
-
-    let v_heat_low = (2.0 * (chamber_diluent_state.h_total - diluent_species_low.h_total)
-        / total_pool_mass)
-        .sqrt();
-    let v_e_low = v_common + v_heat_low;
-    let slow_ecombustion_isp_low = v_heat_low / G_0;
-    let slow_isp_low = slow_electrostatic_isp + slow_ecombustion_isp_low;
-    let slow_engine_thrust_low = v_e_low * (ions_m_dot * coupling_efficiency + diluent_m_dot);
-
-    println!(
-        "[Slow] Chamber Temperature: {:.3} K",
-        chamber_diluent_state.temperature_k
-    );
-    chamber_diluent_state.print_products();
-    println!("[Slow] Electrostatic Isp: {:.0} s", slow_electrostatic_isp);
-    println!("[Slow] Combustion Isp: {:.0} s", slow_combustion_isp);
-    println!("[Slow] Isp: {:.0} s", slow_isp);
-    println!("[Slow] Thrust: {:.3} kN", slow_engine_thrust / 1.0e3);
-    println!("[Slow] Lower Isp: {:.0} s", slow_isp_low);
-    println!(
-        "[Slow] Lower Thrust: {:.3} kN",
-        slow_engine_thrust_low / 1.0e3
-    );
-
-    println!("Ions m dot: {:.3} g/s", ions_m_dot * 1.0e3);
-    println!("Diluent m dot: {:.3} g/s", diluent_m_dot * 1.0e3);
-    let thrust_combined = slow_engine_thrust + plasma_engine_thrust;
-    let v_combined = thrust_combined / (ions_m_dot + diluent_m_dot);
-    let isp_combined = v_combined / G_0;
-    println!("[Combined] Isp: {:.0} s", isp_combined);
-    println!("[Combined] Thrust: {:.3} kN", thrust_combined / 1.0e3);
 
     // This can just use CH4_MW because O_MW == CH4_MW.
     let aperture_area = PI * aperture_diameter.powi(2) / 4.0;
     let total_current = ions_n_dot * F;
-    let apertures_needed = apertures_needed(
+    let apertures_needed_count = apertures_needed(
         total_current,
         aperture_area,
         gap_spacing,
@@ -343,63 +295,112 @@ fn calculate_engine_output(
         convergence_angle_deg
     );
     println!("Total Channel Area: {:.3} m^2", {
-        PI * (aperture_diameter / 2.0).powi(2) * apertures_needed
+        PI * (aperture_diameter / 2.0).powi(2) * apertures_needed_count
     });
     println!(
         "Configured Aperture Diameter: {:.3} mm",
         aperture_diameter * 1.0e3
     );
     println!("Configured Gap Spacing: {:.3} mm", gap_spacing * 1.0e3);
-    println!("Apertures Needed: {:.0}", apertures_needed);
+    println!("Apertures Needed: {:.0}", apertures_needed_count);
 
-    // Nozzle Design
+    // Nozzle Design: if the throat area is fixed (Isp/Mixed Mode, reusing
+    // the area a prior Thrust Mode run derived), the chamber pressure this
+    // engine actually operates at is *derived* from choked flow through
+    // that fixed area — it is not necessarily the nominal `chamber_pressure`
+    // this function was called with. This has to be resolved before the
+    // fast/slow flow sections below, since they both depend on chamber
+    // pressure (nozzle exit pressure, Isp, thrust) and would otherwise
+    // silently use the wrong one whenever the area is fixed.
     let slow_m_dot = ions_m_dot * coupling_efficiency + diluent_m_dot;
-    if let Some(fixed_area) = fixed_total_throat_area {
-        let available_annulus_area = fixed_area - max_channel_area;
-        let actual_chamber_pressure = choked_chamber_pressure_bar(
-            slow_m_dot,
-            available_annulus_area,
-            chamber_diluent_state.temperature_k,
-            mixture_gamma,
-            chamber_diluent_state.avg_mw * 1.0e-3, // g/mol -> kg/mol
-        );
-        println!(
-            "Actual Chamber Pressure: {:.3} bar",
-            actual_chamber_pressure
-        );
-        (Some(actual_chamber_pressure), None)
-    } else {
-        let annulus_area_design = choked_throat_area(
-            slow_m_dot,
-            chamber_pressure,
-            chamber_diluent_state.temperature_k,
-            mixture_gamma,
-            chamber_diluent_state.avg_mw * 1.0e-3, // g/mol -> kg/mol
-        );
-        let fixed_total_area_throat = max_channel_area + annulus_area_design;
-        println!(
-            "Fixed Throat Area: {:.3} mm^2",
-            fixed_total_area_throat * 1.0e6
-        );
-        (None, Some(fixed_total_area_throat))
-    }
+    let diluent_mixture_gamma = mixture_gamma(&chamber_diluent_species);
+
+    let (chamber_pressure_result, fixed_total_area_throat_result) =
+        if let Some(fixed_area) = fixed_total_throat_area {
+            let available_annulus_area = fixed_area - max_channel_area;
+            let actual_chamber_pressure = choked_chamber_pressure_bar(
+                slow_m_dot,
+                available_annulus_area,
+                chamber_diluent_species.temperature_k,
+                diluent_mixture_gamma,
+                chamber_diluent_species.avg_mw * 1.0e-3, // g/mol -> kg/mol
+            );
+            println!(
+                "Actual Chamber Pressure: {:.3} bar",
+                actual_chamber_pressure
+            );
+            (Some(actual_chamber_pressure), None)
+        } else {
+            let annulus_area_design = choked_throat_area(
+                slow_m_dot,
+                chamber_pressure,
+                chamber_diluent_species.temperature_k,
+                diluent_mixture_gamma,
+                chamber_diluent_species.avg_mw * 1.0e-3, // g/mol -> kg/mol
+            );
+            let fixed_total_area_throat = max_channel_area + annulus_area_design;
+            println!(
+                "Fixed Throat Area: {:.3} mm^2",
+                fixed_total_area_throat * 1.0e6
+            );
+            (None, Some(fixed_total_area_throat))
+        };
+    // The pressure this engine actually runs at: the derived one when the
+    // throat area is fixed, otherwise the nominal one (which is exactly
+    // what the area was just designed around).
+    let actual_chamber_pressure = chamber_pressure_result.unwrap_or(chamber_pressure);
+
+    // Handle fast flow.
+    let plasma_total_pool_mass = ions_mw * (1.0 - coupling_efficiency);
+    let plasma_engine_thrust = nozzle_flow_performance(
+        "Fast",
+        &chamber_plasma_species,
+        actual_chamber_pressure,
+        target_area_ratio,
+        v_y,
+        plasma_total_pool_mass,
+        ions_m_dot * (1.0 - coupling_efficiency),
+    );
+
+    // Handle slow flow.
+    let slow_total_pool_mass = ions_mw * coupling_efficiency + diluent.feed_mass() * 1.0e-3; // kg
+    let slow_engine_thrust = nozzle_flow_performance(
+        "Slow",
+        &chamber_diluent_species,
+        actual_chamber_pressure,
+        target_area_ratio,
+        v_common,
+        slow_total_pool_mass,
+        ions_m_dot * coupling_efficiency + diluent_m_dot,
+    );
+
+    println!("Ions m dot: {:.3} g/s", ions_m_dot * 1.0e3);
+    println!("Diluent m dot: {:.3} g/s", diluent_m_dot * 1.0e3);
+    let thrust_combined = slow_engine_thrust + plasma_engine_thrust;
+    let v_combined = thrust_combined / (ions_m_dot + diluent_m_dot);
+    let isp_combined = v_combined / G_0;
+    println!("[Combined] Isp: {:.0} s", isp_combined);
+    println!("[Combined] Thrust: {:.3} kN", thrust_combined / 1.0e3);
+
+    (chamber_pressure_result, fixed_total_area_throat_result)
 }
 
 // TODO RENAME OOGA BOOGA VARIABLES IN THIS like all the state stuff.
-// TODO add some effiency number?
+// TODO add some effiency number? Maybe something like total engine power output is 75MW but only 50MW is usable(which is what I have now with engine_power.)
+// TODO calcualte B field strength required to offset lowered chamber pressure.
 // Where the engine power is not accounting for
 // losses at all
 // Waste heat needs to account for this loss, and loss from fusion to electricity, and
 // the heat from disassociation and water electrolysis
 pub fn sweep_engine() {
-    let voltage = 1_000.0; // Increase this for higher temps
+    let voltage = 1_125.0; // Increase this for higher temps
     let engine_power = 50.0e6;
     let target_area_ratio = 100.0;
     let gap_spacing = 0.05e-3;
     let aperture_diameter = 0.5e-3;
     let funnel_length = 3.0; // meters
     let chamber_pressure = 10.0;
-    let collision_theta_deg = 20.0;
+    let collision_theta_deg = 12.5;
 
     // The beam is really CH4+ and O-, which the solver can't (and needn't)
     // represent: it reduces the feed to elements, and CH4+ + O- has the same
@@ -417,20 +418,8 @@ pub fn sweep_engine() {
     // TODO mixutre has O3 in it for plasma which is non sensical, likely from an extrapolation of
     // the polynomial coefficients far outside the max range of 6,000 K.
 
-    // t_initial is the storage temperature of the propellants (MgH2(b)'s fit
-    // only spans 300-600 K anyway — it decomposes well below 1000 K).
-    // MgO(cr) must be insert-seeded: the products are dominated by condensed
-    // MgO, and without it the gas-only HP solve crashes T toward 0 K.
-    // let tmp = Mixture::new_adiabatic(
-    //     &[(1.0, species!("Mg")), (1.0, species!("O2"))],
-    //     300.0,
-    //     chamber_pressure,
-    //     Some(&[species!("MgO(cr)")]), // Preactivates listed condensed species with nj = 0.
-    // );
-    // tmp.print_products();
-
     let diluent = Mixture::new(
-        &[(1.0, species!("H2")), (19.0, Species::H2O)],
+        &[(1.0, species!("H2")), (28.5, Species::H2O)],
         1_000.0,
         chamber_pressure,
     );
@@ -439,14 +428,13 @@ pub fn sweep_engine() {
     let coupling_efficiency = 0.05;
     let fixed_total_throat_area = None; // Derive area
     println!("===== Thrust Mode =====");
-    calculate_engine_output(
+    let (_, fixed_total_throat_area) = calculate_engine_output(
         voltage,
         collision_theta_deg,
         engine_power,
         chamber_pressure,
         target_area_ratio,
         &ions,
-        1.0, // ion_pair_moles: the CH4 amount in `ions` above
         &diluent,
         gap_spacing,
         aperture_diameter,
@@ -455,7 +443,11 @@ pub fn sweep_engine() {
         fixed_total_throat_area,
     );
 
-    let diluent = Mixture::new(&[(1.0, species!("H2"))], 1_000.0, chamber_pressure);
+    let diluent = Mixture::new(
+        &[(1.0, species!("H2")), (1.0, species!("H2O"))],
+        1_000.0,
+        chamber_pressure,
+    );
 
     let coupling_efficiency = 0.002; // Lower because the length of actual plasma in the chamber is less
     // So there is less time for the plasma to couple energy with the diluetnt.
@@ -467,13 +459,12 @@ pub fn sweep_engine() {
         chamber_pressure,
         target_area_ratio,
         &ions,
-        1.0, // ion_pair_moles: the CH4 amount in `ions` above
         &diluent,
         gap_spacing,
         aperture_diameter,
         funnel_length,
         coupling_efficiency,
-        None,
+        fixed_total_throat_area,
     );
 
     // Using methane clathrate is CH4•5.75H2O
@@ -494,12 +485,11 @@ pub fn sweep_engine() {
         chamber_pressure,
         target_area_ratio,
         &ions,
-        1.0, // ion_pair_moles: the CH4 amount in `ions` above
         &diluent,
         gap_spacing,
         aperture_diameter,
         funnel_length,
         coupling_efficiency,
-        None,
+        fixed_total_throat_area,
     );
 }
