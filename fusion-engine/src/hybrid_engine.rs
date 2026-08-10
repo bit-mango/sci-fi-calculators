@@ -482,7 +482,7 @@ pub fn sweep_engine() {
         chamber_pressure,
     );
 
-    let coupling_efficiency = 0.01; // Lower because the length of actual plasma in the chamber is less
+    let coupling_efficiency = 0.01; // In between because the length of actual plasma in the chamber is less
     // So there is less time for the plasma to couple energy with the diluetnt.
     println!("===== Mixed Mode =====");
     calculate_engine_output(
