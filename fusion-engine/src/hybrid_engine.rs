@@ -55,16 +55,6 @@ fn funnel_convergence_half_angle_deg(
         .to_degrees()
 }
 
-fn solve_for_chamber_state(q_chamber: f64, ions: &Mixture, diluent: Option<&Mixture>) -> Mixture {
-    // Mix ions and diluent.
-    let mixture = if let Some(diluent) = diluent {
-        ions.mix(diluent)
-    } else {
-        ions.clone()
-    };
-    mixture.with_heat_addition(q_chamber)
-}
-
 fn choked_throat_area(
     m_dot: f64,
     pressure_bar: f64,
@@ -111,7 +101,7 @@ fn calculate_engine_output(
     coupling_efficiency: f64,
     fixed_total_throat_area: Option<f64>,
 ) -> (Option<f64>, Option<f64>) {
-    let ions = ions.scale(1.0 / ion_pair_moles);
+    let ions = ions.clone().scale(1.0 / ion_pair_moles);
 
     // Start with CH4 + H20 ion feeds.
     let mut total_energy_in_per_ions_mole = 0.0;
@@ -173,11 +163,17 @@ fn calculate_engine_output(
     let q_chamber_diluent = q_chamber * coupling_efficiency + q_mixing; // J/mol
 
     let plasma = &ions;
-    let plasma_species = plasma.scale(1.0 - coupling_efficiency);
-    let chamber_plasma_state = solve_for_chamber_state(q_chamber_plasma, &plasma_species, None);
-    let diluent_species = plasma.scale(coupling_efficiency);
-    let chamber_diluent_state =
-        solve_for_chamber_state(q_chamber_diluent, &diluent_species, Some(diluent));
+    let plasma_species = plasma.clone().scale(1.0 - coupling_efficiency);
+    let chamber_plasma_state = plasma_species
+        .with_heat_addition(q_chamber_plasma, None, None)
+        .expect("Failed to heat plasma species.");
+    let diluent_species = plasma.clone().scale(coupling_efficiency);
+    let diluent_mix = diluent_species
+        .mix(diluent.clone())
+        .expect("Failed to mix diliuent.");
+    let chamber_diluent_state = diluent_mix
+        .with_heat_addition(q_chamber_diluent, None, None)
+        .expect("Failed to heat dilunet");
 
     // Handle fast flow.
     // Mixture properties.
@@ -192,8 +188,11 @@ fn calculate_engine_output(
     // Nozzle expansion. full equilibrium flow for upper bound Isp.
     let exit_temperature = chamber_plasma_state.temperature_k
         * (exit_pressure / chamber_pressure).powf((mixture_gamma - 1.0) / mixture_gamma);
-    let plasma_species = chamber_plasma_state.with_isentropic_expansion(exit_pressure);
-    let plasma_species_low = Mixture::new_with_frozen_reactants(
+    let plasma_species = chamber_plasma_state
+        .clone()
+        .with_equilibrium_expansion(exit_pressure, None, None)
+        .expect("Failed equilibrium expansion");
+    let plasma_species_low = Mixture::new(
         &chamber_plasma_state.products,
         exit_temperature,
         exit_pressure,
@@ -247,8 +246,11 @@ fn calculate_engine_output(
     // Nozzle expansion. full equilibrium flow for upper bound Isp.
     let exit_temperature = chamber_diluent_state.temperature_k
         * (exit_pressure / chamber_pressure).powf((mixture_gamma - 1.0) / mixture_gamma);
-    let diluent_species = chamber_diluent_state.with_isentropic_expansion(exit_pressure);
-    let diluent_species_low = Mixture::new_with_frozen_reactants(
+    let diluent_species = chamber_diluent_state
+        .clone()
+        .with_equilibrium_expansion(exit_pressure, None, None)
+        .expect("Failed equilibrium expansion");
+    let diluent_species_low = Mixture::new(
         &chamber_diluent_state.products,
         exit_temperature,
         exit_pressure,
@@ -406,7 +408,7 @@ pub fn sweep_engine() {
     // to C(gr) + H2O before the chamber): keep it frozen, and let the
     // chamber's HP solve release the reaction energy from the formation
     // enthalpies. The ionization offset is added manually via q_chamber.
-    let ions = Mixture::new_with_frozen_reactants(
+    let ions = Mixture::new(
         &[(1.0, species!("CH4")), (1.0, species!("O"))],
         273.0,
         chamber_pressure,

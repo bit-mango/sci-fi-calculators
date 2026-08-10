@@ -1,8 +1,10 @@
 use super::equilibrium::{EquilibriumError, EquilibriumMode, solve_for_products};
-use crate::constants::*;
 use std::collections::HashMap;
 use std::f64;
 use thermo_species::Species;
+
+const R: f64 = 8.314; // Ideal Gas Constant [J/mol•K]
+pub const STD_REFERENCE_PRESSURE: f64 = 1.0; // [bar]
 
 const MAX_FROZEN_ITERS: usize = 10;
 const FROZEN_EXPANSION_TOL: f64 = 1.0e-6;
@@ -288,23 +290,23 @@ impl Mixture {
         };
 
         // Create reactant mix using adjusted other.
-        let mut reatants_mix: HashMap<String, (f64, Species)> = HashMap::new();
+        let mut reactants_mix: HashMap<String, (f64, Species)> = HashMap::new();
         // Add all of original reatants to mix.
         for s in hot.products.iter() {
             let key = s.1.data().symbol();
-            reatants_mix.insert(key.to_string(), *s);
+            reactants_mix.insert(key.to_string(), *s);
         }
         for o in cold_adj.products.iter() {
             let key = o.1.data().symbol();
-            if let Some(entry) = reatants_mix.get_mut(key) {
+            if let Some(entry) = reactants_mix.get_mut(key) {
                 // reatants already exists! Increment moles.
                 entry.0 += o.0;
             } else {
                 // reatants is new, add them.
-                reatants_mix.insert(key.to_string(), *o);
+                reactants_mix.insert(key.to_string(), *o);
             }
         }
-        let mut reactants = reatants_mix
+        let mut reactants = reactants_mix
             .drain()
             .map(|(_, v)| v)
             .collect::<Vec<(f64, Species)>>();
@@ -384,7 +386,7 @@ impl Mixture {
         let state = solve_for_products(
             &self.products,
             EquilibriumMode::HP {
-                h_over_r: h_target / self.feed_mass(),
+                h_over_r: h_target / (R * self.feed_mass()),
                 pressure_bar,
             },
             true,
